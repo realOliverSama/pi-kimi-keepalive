@@ -637,7 +637,7 @@ test("mode=smart persists and 5 consecutive hits grow the cadence by 30s", async
   clearHomeState();
   writeState({
     enabled: false,
-    intervalMs: 7 * 60_000,
+    intervalMs: 8 * 60_000,
     maxIdleMs: 0,
     spendCapUsd: 0,
     minPromptTokens: 512,
@@ -654,7 +654,7 @@ test("mode=smart persists and 5 consecutive hits grow the cadence by 30s", async
   await captureOnce(pi, ctx);
   await pi.command("on", ctx);
 
-  // Five floor hits confirm the 7m cadence and promote it to 7m30s.
+  // Five floor hits confirm the 8m cadence and promote it to 8m30s.
   for (let i = 0; i < 5; i++) {
     await pi.command("now", ctx);
     await settle(pi, ctx);
@@ -663,14 +663,14 @@ test("mode=smart persists and 5 consecutive hits grow the cadence by 30s", async
   assert.equal(fetchStub.calls.length, 5);
   const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
   assert.equal(persisted.mode, "smart");
-  assert.equal(persisted.intervalMs, 7 * 60_000 + 30_000);
+  assert.equal(persisted.intervalMs, 8 * 60_000 + 30_000);
 });
 
-test("one miss steps back to the last confirmed cadence without pausing", async (t) => {
+test("a smart miss parks probing, steps back to the confirmed cadence, and survives a real turn", async (t) => {
   clearHomeState();
   writeState({
     enabled: false,
-    intervalMs: 7 * 60_000 + 30_000,
+    intervalMs: 8 * 60_000 + 30_000,
     maxIdleMs: 0,
     spendCapUsd: 0,
     minPromptTokens: 512,
@@ -688,19 +688,29 @@ test("one miss steps back to the last confirmed cadence without pausing", async 
   await captureOnce(pi, ctx);
 
   await pi.command("now", ctx);
-  await settle(pi, ctx);
   await settle(pi, ctx);
   assert.equal(fetchStub.calls.length, 1);
   const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
-  assert.equal(persisted.intervalMs, 7 * 60_000);
-  assert.ok(!lastNotification(ctx).match(/paused/));
+  assert.equal(persisted.intervalMs, 8 * 60_000);
+  assert.match(lastNotification(ctx), /cache miss in smart mode/);
+
+  // A fresh real turn does NOT resume probing after a smart miss:
+  // status still shows the pause and no further probe fires.
+  await captureOnce(pi, ctx);
+  await settle(pi, ctx);
+  await sleep(50);
+  assert.equal(fetchStub.calls.length, 1);
+  const before = ctx.ui.notifications.length;
+  await pi.command("status", ctx);
+  const status = ctx.ui.notifications.slice(before).map((n) => n.text).join("\n");
+  assert.match(status, /paused: cache miss in smart mode/);
 });
 
-test("smart mode pauses only after two consecutive misses at the floor", async (t) => {
+test("smart mode parks probing on the first miss and resumes on mode=smart", async (t) => {
   clearHomeState();
   writeState({
     enabled: false,
-    intervalMs: 7 * 60_000,
+    intervalMs: 8 * 60_000,
     maxIdleMs: 0,
     spendCapUsd: 0,
     minPromptTokens: 512,
@@ -720,17 +730,20 @@ test("smart mode pauses only after two consecutive misses at the floor", async (
 
   await pi.command("now", ctx);
   await settle(pi, ctx);
-  assert.ok(!lastNotification(ctx).match(/paused/)); // first floor miss: keep going
-  await pi.command("now", ctx);
+  assert.match(lastNotification(ctx), /cache miss in smart mode/); // a single miss parks probing
+  assert.match(lastNotification(ctx), /already at the floor/);
+  // Re-selecting smart mode is the documented way to resume probing.
+  await pi.command("mode=smart", ctx);
   await settle(pi, ctx);
-  assert.match(lastNotification(ctx), /paused/);
+  await sleep(50);
+  assert.ok(!lastNotification(ctx).match(/paused/));
 });
 
 test("smart mode freezes growth and reverts to the floor above 200k context", async (t) => {
   clearHomeState();
   writeState({
     enabled: false,
-    intervalMs: 7 * 60_000 + 30_000,
+    intervalMs: 8 * 60_000 + 30_000,
     maxIdleMs: 0,
     spendCapUsd: 0,
     minPromptTokens: 512,
@@ -752,7 +765,7 @@ test("smart mode freezes growth and reverts to the floor above 200k context", as
   await pi.command("now", ctx);
   await settle(pi, ctx);
   let persisted = JSON.parse(readFileSync(statePath(), "utf8"));
-  assert.equal(persisted.intervalMs, 7 * 60_000);
+  assert.equal(persisted.intervalMs, 8 * 60_000);
   // …and further big-context hits never re-promote it.
   await pi.command("now", ctx);
   await settle(pi, ctx);
@@ -761,14 +774,14 @@ test("smart mode freezes growth and reverts to the floor above 200k context", as
   await pi.command("now", ctx);
   await settle(pi, ctx);
   persisted = JSON.parse(readFileSync(statePath(), "utf8"));
-  assert.equal(persisted.intervalMs, 7 * 60_000);
+  assert.equal(persisted.intervalMs, 8 * 60_000);
 });
 
 test("interval= is rejected while smart mode manages the cadence", async (t) => {
   clearHomeState();
   writeState({
     enabled: false,
-    intervalMs: 7 * 60_000,
+    intervalMs: 8 * 60_000,
     maxIdleMs: 0,
     spendCapUsd: 0,
     minPromptTokens: 512,
@@ -780,6 +793,6 @@ test("interval= is rejected while smart mode manages the cadence", async (t) => 
   await captureOnce(pi, ctx);
   await pi.command("interval=9m", ctx);
   const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
-  assert.equal(persisted.intervalMs, 7 * 60_000);
+  assert.equal(persisted.intervalMs, 8 * 60_000);
   assert.match(lastNotification(ctx), /smart mode manages the cadence/);
 });

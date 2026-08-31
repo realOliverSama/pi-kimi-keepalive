@@ -81,7 +81,7 @@ const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
   // dead, and the default miss=1 stops probing right after — worst-case total
   // spend is one cold read per session. Use /keepalive interval=4m45s for a
   // hit-mode heartbeat (every probe is a cache read, ~10x cheaper).
-  intervalMs: 7 * 60_000,
+  intervalMs: 8 * 60_000,
   maxIdleMs: 30 * 60_000,
   minPromptTokens: 512,
   maxOutputTokens: 16,
@@ -93,11 +93,10 @@ const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
 });
 
 // smart-mode constants
-const SMART_BASE_MS = 7 * 60_000; // starting cadence (user-verified to still hit)
+const SMART_BASE_MS = 8 * 60_000; // smart starting/floor cadence (matches the default interval)
 const SMART_STEP_MS = 30_000; // +30s per 5-hit confirmation
 const SMART_CONFIRM_HITS = 5;
 const SMART_MAX_CONTEXT_TOKENS = 200_000; // context cap: grow only below this
-const SMART_FLOOR_MISSES_TO_PAUSE = 2; // misses needed at the floor cadence before pausing
 
 const MIN_INTERVAL_MS = 30_000;
 const PROBE_TIMEOUT_MS = 30_000;
@@ -109,7 +108,7 @@ const HELP_TEXT = [
   "  /keepalive on|off         enable / disable (persisted)",
   "  /keepalive now            one manual probe (bypasses pauses)",
   "  /keepalive resume         clear a sticky pause",
-  "  /keepalive mode=smart     adaptive cadence (7m floor, +30s per 5-hit confirmation, back off on miss)",
+  "  /keepalive mode=smart     adaptive cadence (8m floor; +30s per 5-hit confirmation; a miss pauses probing, mode=smart resumes)",
   "  /keepalive mode=default   fixed cadence (the interval= value)",
   "  /keepalive interval=4m45s probe cadence (default mode; >= 30s; <= 5m stays inside the cache TTL)",
   "  /keepalive maxidle=30m    stop probing after this idle time (0 = never stop)",
@@ -158,7 +157,9 @@ export default function (pi: ExtensionAPI) {
   let errorStreak = 0;
   // smart-mode runtime state (cadence itself lives in config.intervalMs, persisted)
   let smartHitStreak = 0;
-  let smartFloorMisses = 0;
+  // Set when a smart-mode miss pauses probing; only re-selecting smart mode
+  // clears it (a fresh real turn does NOT resume probing in this case).
+  let smartPaused = false;
   let lastProbeInputTokens = 0;
   const stats: Stats = { probes: 0, hits: 0, misses: 0, errors: 0, savedUsd: 0, spendUsd: 0 };
 
@@ -233,7 +234,7 @@ export default function (pi: ExtensionAPI) {
       config.initialized = true;
       persistConfig();
       notify(
-        "Setup skipped — defaults kept (mode default/7m, maxidle 30m, miss 1, errors 3, cap $1.00). " +
+        "Setup skipped — defaults kept (mode default/8m, maxidle 30m, miss 1, errors 3, cap $1.00). " +
           "Run /keepalive setup to configure later, /keepalive on to enable.",
         "info",
       );
@@ -318,9 +319,9 @@ export default function (pi: ExtensionAPI) {
     const modeRaw = await wizardCtx.ui.input(
       "Step 5/5 — Probing mode (now " + config.mode + ")\n" +
         "default: probes run at the fixed interval above.\n" +
-        "smart: starts at 7m; after 5 consecutive hits (context ≤ 200k) the cadence grows by 30s, " +
-        "and one miss steps back to the last confirmed value — it self-tunes toward the real cache TTL " +
-        "to minimize probe spend.\n" +
+        "smart: starts at 8m; after 5 consecutive hits (context ≤ 200k) the cadence grows by 30s; " +
+        "one miss steps back to the last confirmed value and parks probing until you re-select smart mode — " +
+        "it self-tunes toward the real cache TTL to minimize probe spend.\n" +
         "Type smart to enable; leave empty / press Esc for default.",
       "",
     );
@@ -328,6 +329,7 @@ export default function (pi: ExtensionAPI) {
       const v = modeRaw.trim().toLowerCase();
       if (v === "smart" || v === "default") {
         config.mode = v;
+        smartPaused = false;
         if (v === "smart" && config.intervalMs < SMART_BASE_MS) config.intervalMs = SMART_BASE_MS;
       } else if (v !== "") {
         notify(`Unknown mode "${modeRaw}" — keeping ${config.mode}`, "error");
@@ -551,7 +553,6 @@ export default function (pi: ExtensionAPI) {
       stats.savedUsd += estimateSavedUsd(usage.cacheReadTokens, capture.cost);
       missStreak = 0;
       errorStreak = 0;
-      smartFloorMisses = 0;
       debug(
         `probe hit: cache_read=${usage.cacheReadTokens} input=${usage.inputTokens} saved=${stats.savedUsd.toFixed(4)}`,
       );
@@ -589,14 +590,12 @@ export default function (pi: ExtensionAPI) {
    * config.intervalMs doubles as the persisted "last confirmed cadence":
    * promotion only ever happens after SMART_CONFIRM_HITS consecutive hits, so
    * the value on disk is always one the cache has actually held for. A miss
-   * steps back 30s to that last confirmed value (never below the 7m floor).
+   * steps back 30s to that last confirmed value (never below the 8m floor),
+   * persists it, and pauses probing — a fresh real turn does NOT resume;
+   * only re-selecting smart mode (`/keepalive mode=smart`) continues.
    * Contexts above 200k tokens are never pushed upward and immediately revert
    * to the floor cadence, because a miss there costs too much full-price
    * input to risk.
-   *
-   * Floor misses (a miss at 7m means the cache is younger than the starting
-   * cadence — server TTL changed or account trouble) pause after
-   * SMART_FLOOR_MISSES_TO_PAUSE consecutive occurrences.
    */
   function smartAdaptAfterHit(inputTokens: number): void {
     if (inputTokens > SMART_MAX_CONTEXT_TOKENS) {
@@ -605,7 +604,7 @@ export default function (pi: ExtensionAPI) {
         config.intervalMs = SMART_BASE_MS;
         persistConfig();
         notify(
-          `smart: context ${inputTokens} tokens exceeds ${SMART_MAX_CONTEXT_TOKENS / 1000}k — cadence back to the 7m floor`,
+          `smart: context ${inputTokens} tokens exceeds ${SMART_MAX_CONTEXT_TOKENS / 1000}k — cadence back to the 8m floor`,
           "info",
         );
       }
@@ -630,25 +629,18 @@ export default function (pi: ExtensionAPI) {
 
   function smartAdaptAfterMiss(): void {
     smartHitStreak = 0;
-    if (config.intervalMs > SMART_BASE_MS) {
-      // Step back to the last confirmed cadence.
+    const fellBack = config.intervalMs > SMART_BASE_MS;
+    if (fellBack) {
+      // Step back to the last confirmed cadence before pausing.
       config.intervalMs = Math.max(SMART_BASE_MS, config.intervalMs - SMART_STEP_MS);
       persistConfig();
-      notify(
-        `smart: cache miss — cadence back to ${formatDuration(config.intervalMs)}`,
-        "info",
-      );
-      updateUi();
-      return;
     }
-    // Already at the floor: repeated misses there mean the cache is gone.
-    smartFloorMisses += 1;
-    debug(`smart: floor miss #${smartFloorMisses}`);
-    if (smartFloorMisses >= SMART_FLOOR_MISSES_TO_PAUSE) {
-      pause(
-        `${smartFloorMisses} consecutive misses at the 7m floor cadence; waiting for your next real turn`,
-      );
-    }
+    smartPaused = true;
+    pause(
+      `cache miss in smart mode — cadence ${fellBack ? `back to ${formatDuration(config.intervalMs)}` : "already at the floor"}; ` +
+        `probing stopped, run /keepalive mode=smart to resume`,
+    );
+    updateUi();
   }
 
   function recordFailure(message: string): void {
@@ -769,11 +761,14 @@ export default function (pi: ExtensionAPI) {
             }
             break;
           case "resume":
+            if (smartPaused) {
+              notify("smart-mode pause is intentional — run /keepalive mode=smart to resume probing", "warning");
+              break;
+            }
             pausedReason = null;
             missStreak = 0;
             errorStreak = 0;
             smartHitStreak = 0;
-            smartFloorMisses = 0;
             notify("keepalive resumed", "info");
             break;
           case "mode": {
@@ -783,18 +778,16 @@ export default function (pi: ExtensionAPI) {
               break;
             }
             config.mode = next;
+            smartHitStreak = 0;
+            smartPaused = false; // re-selecting the mode is the documented way out of a smart miss-pause
             if (next === "smart") {
               // smart manages the cadence itself; snap back to its floor.
               if (config.intervalMs < SMART_BASE_MS) config.intervalMs = SMART_BASE_MS;
-              smartHitStreak = 0;
-              smartFloorMisses = 0;
               notify(
-                `mode=smart — starting at ${formatDuration(config.intervalMs)}; +30s per ${SMART_CONFIRM_HITS} hits (context ≤ ${SMART_MAX_CONTEXT_TOKENS / 1000}k), one miss steps back`,
+                `mode=smart — probing resumes at ${formatDuration(config.intervalMs)}; +30s per ${SMART_CONFIRM_HITS} hits (context ≤ ${SMART_MAX_CONTEXT_TOKENS / 1000}k), one miss parks probing`,
                 "info",
               );
             } else {
-              smartHitStreak = 0;
-              smartFloorMisses = 0;
               notify("mode=default — fixed cadence via /keepalive interval=<duration>", "info");
             }
             persistConfig();
@@ -938,12 +931,23 @@ export default function (pi: ExtensionAPI) {
       cost: (model.cost ?? undefined) as Partial<CostPerM> | undefined,
     };
     // A fresh real request means fresh credentials and a warm prefix cache;
-    // automatically recover from any sticky pause.
+    // automatically recover from any sticky pause. Exception: a smart-mode
+    // miss intentionally parks probing until the user re-selects smart mode.
     if (pausedReason !== null || missStreak > 0 || errorStreak > 0) {
-      pausedReason = null;
+      if (smartPaused) {
+        if (pausedReason !== null) {
+          debug("fresh real request observed — smart-mode miss pause kept; /keepalive mode=smart to resume");
+          missStreak = 0;
+          errorStreak = 0;
+          updateUi();
+          return;
+        }
+      } else {
+        pausedReason = null;
+        debug("fresh real request observed — keepalive unpaused");
+      }
       missStreak = 0;
       errorStreak = 0;
-      debug("fresh real request observed — keepalive unpaused");
     }
     updateUi();
   });

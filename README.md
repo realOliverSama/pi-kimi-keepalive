@@ -46,17 +46,17 @@ The wizard ends with a prompt to enable keepalive. Probing starts after the next
 
 Two modes share the same guardrails; they differ in how the cadence is chosen.
 
-**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **7 minutes** by default — deliberately past the ~5-minute cache TTL. A 7-minute probe never hits the cache: it runs once at full input price, confirms the cache has expired, and the default `miss=1` stops probing immediately, so the worst case is a single cold read per idle period. For an always-warm session instead, set a cadence inside the TTL (`/keepalive interval=4m45s`): every probe is then billed at cache-read rates (~1/10 of full price) and the loop keeps running until `maxidle` cuts it off.
+**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **8 minutes** by default — deliberately past the ~5-minute nominal cache TTL. An 8-minute probe rarely hits the cache: it runs once at full input price, confirms the cache has expired, and the default `miss=1` stops probing immediately, so the worst case is a single cold read per idle period. For an always-warm session instead, set a cadence inside the observed TTL (`/keepalive interval=4m45s`…`7m`): every probe is then billed at cache-read rates (~1/10 of full price) and the loop keeps running until `maxidle` cuts it off.
 
 **`smart` (`/keepalive mode=smart`)** — self-tunes the cadence toward the real cache TTL instead of guessing it:
 
-1. Starts at **7 minutes**.
+1. Starts at **8 minutes**.
 2. After **5 consecutive hits** the cadence is confirmed and the value grows by **+30s**. Only confirmed values are persisted, so `~/.pi/cache-keepalive/state.json` always holds the largest cadence with observed consecutive hits.
-3. A **miss** immediately steps the cadence back **30s** to the last confirmed value (and to the 7m floor at most), keeps probing, and persists the new value.
-4. **Context guard:** growth only happens while the last probe saw ≤ **200k prompt tokens**; the first probe above that immediately reverts the cadence to the 7m floor and keeps it there (a missed probe on a 200k+ context is too expensive to risk).
-5. Two consecutive misses **at the 7m floor** pause probing — the live cache is younger than the starting cadence, and `resume` after a real turn re-arms.
+3. A **miss** immediately parks probing: the cadence steps back **30s** to the last confirmed value (never below the 8m floor), the value is persisted, and probing stays **stopped**. A fresh real turn does **not** resume it — only re-selecting smart mode (`/keepalive mode=smart`) continues from the parked cadence.
+4. **Context guard:** growth only happens while the last probe saw ≤ **200k prompt tokens**; the first probe above that immediately reverts the cadence to the 8m floor and keeps it there (a missed probe on a 200k+ context is too expensive to risk).
+5. Guardrails (`maxidle`, `cap`, `errors`, HTTP 401/403) still apply while smart is probing.
 
-The cadence therefore oscillates just under the real TTL: most probes are cache-read priced, and full-price probes happen only once per growth attempt that overshoots.
+Per learn cycle the spend is minimal: 5 cache-read probes confirm a step, and one full-price probe ends the cycle — the parked cadence keeps every future session at the highest value the cache has proven to hold.
 
 ## Commands
 
@@ -66,7 +66,7 @@ The cadence therefore oscillates just under the real TTL: most probes are cache-
 /keepalive on|off           enable / disable (persisted)
 /keepalive now              one manual probe (bypasses pauses)
 /keepalive resume           clear a sticky pause
-/keepalive mode=smart       adaptive cadence (7m floor; +30s per 5-hit confirmation; −30s on miss)
+/keepalive mode=smart       adaptive cadence (8m floor; +30s per 5-hit confirmation; a miss parks probing, mode=smart resumes)
 /keepalive mode=default     fixed cadence (the interval= value)
 /keepalive interval=4m45s   probe cadence in default mode (≥ 30s; ≤ 5m to stay inside the cache TTL)
 /keepalive maxidle=30m      idle cutoff (0 = disabled)
