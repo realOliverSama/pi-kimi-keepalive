@@ -22,26 +22,27 @@ import * as lib from "../src/lib.ts";
 // fixtures
 // ---------------------------------------------------------------------------
 
-const BASE_URL = "https://api.kimi.com/coding";
+const BASE_URL = "https://api.kimi.com/coding/v1";
 
 const PAYLOAD = {
   model: "k3",
-  max_tokens: 8192,
-  stream: true,
-  thinking: { type: "enabled", budget_tokens: 2048 },
-  temperature: 1,
-  system: [{ type: "text", text: "You are pi, a coding agent." }],
   messages: [
     { role: "user", content: [{ type: "text", text: "hello" }] },
     { role: "assistant", content: [{ type: "text", text: "hi!" }] },
   ],
-  tools: [{ name: "read", description: "read a file", input_schema: { type: "object" } }],
+  stream: true,
+  prompt_cache_key: "sess-abc123",
+  prompt_cache_retention: "5m",
+  stream_options: { include_usage: true },
+  store: true,
+  max_completion_tokens: 8192,
+  temperature: 1,
+  tools: [{ type: "function", function: { name: "read", description: "read a file", parameters: { type: "object" } } }],
+  thinking: { effort: "high" },
 };
 
 const HEADERS = {
   authorization: "Bearer test-token",
-  "x-api-key": "sk-test",
-  "anthropic-version": "2023-06-01",
   "user-agent": "pi/0.84.4",
   "content-type": "application/json",
   "content-length": "12345",
@@ -97,7 +98,7 @@ function makeCtx({ idle = true, model, inputs = [], confirms = [] } = {}) {
     model: model ?? {
       id: "k3",
       provider: "kimi-coding",
-      api: "anthropic-messages",
+      api: "kimi-openai-completions",
       baseUrl: BASE_URL,
       cost: K3_COST,
     },
@@ -221,41 +222,74 @@ test("parseUsageFromSse scans usage fragments", () => {
   assert.equal(usage.cacheReadTokens, 500);
 });
 
-test("buildProbeHeaders drops hop-by-hop headers and forces json content-type", () => {
+test("buildProbeHeaders forwards auth, drops hop-by-hop headers", () => {
   const out = lib.buildProbeHeaders(HEADERS);
   assert.equal(out.authorization, "Bearer test-token");
-  assert.equal(out["x-api-key"], "sk-test");
-  assert.equal(out["anthropic-version"], "2023-06-01");
   assert.equal(out["content-type"], "application/json");
   assert.ok(!("content-length" in out));
   assert.ok(!("host" in out));
   assert.ok(!("connection" in out));
 });
 
-test("buildProbeBody clamps terminal params and keeps the prefix pristine", () => {
-  const { ok, body } = lib.buildProbeBody(PAYLOAD, 16, true);
+test("buildProbeHeaders forwards auth, drops hop-by-hop headers", () => {
+  const out = lib.buildProbeHeaders(HEADERS);
+  assert.equal(out.authorization, "Bearer test-token");
+  assert.equal(out["content-type"], "application/json");
+  assert.ok(!("content-length" in out));
+  assert.ok(!("host" in out));
+  assert.ok(!("connection" in out));
+});
+
+test("buildProbeBody clamps terminal params and keeps the kimi-openai prefix pristine", () => {
+  const { ok, body } = lib.buildProbeBody(PAYLOAD, 16, "kimi-openai-completions", 1);
   assert.equal(ok, true);
-  assert.equal(body.max_tokens, 16);
+  assert.equal(body.max_completion_tokens, 16);
   assert.ok(!("stream" in body));
+  assert.ok(!("stream_options" in body));
   assert.ok(!("thinking" in body));
-  assert.deepEqual(body.tool_choice, { type: "none" });
+  assert.ok(!("store" in body));
+  assert.ok(!("tool_choice" in body));
+  // the cache-relevant fields stay untouched
   assert.deepEqual(body.messages, PAYLOAD.messages);
-  assert.deepEqual(body.system, PAYLOAD.system);
   assert.deepEqual(body.tools, PAYLOAD.tools);
+  assert.equal(body.prompt_cache_key, PAYLOAD.prompt_cache_key);
+  assert.equal(body.prompt_cache_retention, PAYLOAD.prompt_cache_retention);
   assert.equal(body.temperature, PAYLOAD.temperature);
   assert.equal(body.model, PAYLOAD.model);
 });
 
-test("buildProbeBody omits tool_choice on the fallback attempt", () => {
-  const { body } = lib.buildProbeBody(PAYLOAD, 16, false);
-  assert.ok(!("tool_choice" in body));
+test("buildProbeBody drops prompt_cache_retention on the fallback attempt", () => {
+  const { body } = lib.buildProbeBody(PAYLOAD, 16, "kimi-openai-completions", 2);
+  assert.ok(!("prompt_cache_retention" in body));
+  assert.equal(body.max_completion_tokens, 16);
+});
+
+test("buildProbeBody handles the anthropic-messages dialect", () => {
+  const payload = {
+    model: "k3",
+    stream: true,
+    thinking: { type: "enabled", budget_tokens: 2048 },
+    system: "You are pi.",
+    messages: [{ role: "user", content: "hello" }],
+  };
+  const first = lib.buildProbeBody(payload, 16, "anthropic-messages", 1);
+  assert.equal(first.ok, true);
+  if (first.ok) {
+    assert.equal(first.body.max_tokens, 16);
+    assert.ok(!("stream" in first.body));
+    assert.ok(!("thinking" in first.body));
+    assert.deepEqual(first.body.tool_choice, { type: "none" });
+    assert.deepEqual(first.body.messages, payload.messages);
+  }
+  const retry = lib.buildProbeBody(payload, 16, "anthropic-messages", 2);
+  if (retry.ok) assert.ok(!("tool_choice" in retry.body));
 });
 
 test("buildProbeBody rejects malformed payloads", () => {
-  assert.equal(lib.buildProbeBody(null, 16, true).ok, false);
-  assert.equal(lib.buildProbeBody({ messages: [] }, 16, true).ok, false);
+  assert.equal(lib.buildProbeBody(null, 16, "kimi-openai-completions", 1).ok, false);
+  assert.equal(lib.buildProbeBody({ messages: [] }, 16, "kimi-openai-completions", 1).ok, false);
   assert.equal(
-    lib.buildProbeBody({ messages: [{ role: "user", content: "x" }], system: 42 }, 16, true).ok,
+    lib.buildProbeBody({ messages: [{ role: "user", content: "x" }], system: 42 }, 16, "kimi-openai-completions", 1).ok,
     false,
   );
 });
@@ -312,17 +346,19 @@ test("captures a real request and probes on schedule with a clamped body", async
 
   assert.equal(fetchStub.calls.length, 1);
   const call = fetchStub.calls[0];
-  assert.equal(call.url, `${BASE_URL}/v1/messages`);
+  assert.equal(call.url, `${BASE_URL}/chat/completions`);
   assert.equal(call.init.method, "POST");
   assert.equal(call.init.headers.authorization, "Bearer test-token");
   assert.ok(!("content-length" in call.init.headers));
   const body = JSON.parse(call.init.body);
-  assert.equal(body.max_tokens, 16);
+  assert.equal(body.max_completion_tokens, 16);
   assert.ok(!("stream" in body));
+  assert.ok(!("stream_options" in body));
   assert.ok(!("thinking" in body));
-  assert.deepEqual(body.tool_choice, { type: "none" });
+  assert.ok(!("store" in body));
+  assert.ok(!("tool_choice" in body));
+  assert.equal(body.prompt_cache_key, PAYLOAD.prompt_cache_key);
   assert.deepEqual(body.messages, PAYLOAD.messages);
-  assert.deepEqual(body.system, PAYLOAD.system);
   assert.deepEqual(body.tools, PAYLOAD.tools);
 
   const before = ctx.ui.notifications.length;
@@ -394,7 +430,7 @@ test("two consecutive cache misses pause probing until the next real turn", asyn
   assert.equal(fetchStub.calls.length, 3);
 });
 
-test("HTTP 400 mentioning tool_choice triggers one retry without tool_choice", async (t) => {
+test("HTTP 400 triggers one retry without prompt_cache_retention", async (t) => {
   clearHomeState();
   writeState({ enabled: false, intervalMs: 1100, spendCapUsd: 0, minPromptTokens: 512 });
   const pi = makePi();
@@ -404,14 +440,16 @@ test("HTTP 400 mentioning tool_choice triggers one retry without tool_choice", a
     await shutdown(pi, ctx);
     fetchStub.restore();
   });
-  fetchStub.queue.push({ status: 400, body: { error: { message: "tool_choice type none is not supported here" } } });
+  fetchStub.queue.push({ status: 400, body: { error: { message: "prompt_cache_retention is not supported in this mode" } } });
   factory(pi);
   await captureOnce(pi, ctx);
   await pi.command("on", ctx);
   await pi.command("now", ctx);
 
   assert.equal(fetchStub.calls.length, 2);
+  assert.equal(fetchStub.calls[0].url, `${BASE_URL}/chat/completions`);
   const retryBody = JSON.parse(fetchStub.calls[1].init.body);
+  assert.ok(!("prompt_cache_retention" in retryBody));
   assert.ok(!("tool_choice" in retryBody));
   assert.deepEqual(retryBody.messages, PAYLOAD.messages);
   assert.match(ctx.ui.notifications.map((n) => n.text).join("\n"), /probes:\s*1 \(hits 1/);

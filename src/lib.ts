@@ -42,16 +42,23 @@ export function buildProbeHeaders(captured: Record<string, string>): Record<stri
 /**
  * Build a keepalive probe body from a captured provider payload.
  *
- * The conversation prefix (system/messages/tools and any cache_control
- * markers inside them) is kept byte-identical so the request hits the same
- * automatic prefix cache. Only terminal parameters change: non-streaming,
- * tiny max_tokens, no thinking block, and (attempt 1 only) tool_choice none
- * so the model cannot spend output on tool calls.
+ * The conversation prefix (messages / tools / system role, plus Kimi's
+ * prompt_cache_key / prompt_cache_retention) is kept byte-identical so the
+ * request hits the same automatic prefix cache. Only terminal parameters
+ * change: non-streaming and a tiny output clamp.
+ *
+ * `api` selects the payload dialect: anthropic-messages uses max_tokens /
+ * optional tool_choice:{type:"none"}; everything else is treated as the
+ * OpenAI-completions style that kimi-openai-completions actually uses
+ * (max_completion_tokens; stream_options / thinking / store removed).
+ * attempt 2 drops prompt_cache_retention when the endpoint rejects a
+ * terminal parameter (HTTP 400) — the prefix is never modified.
  */
 export function buildProbeBody(
   payload: unknown,
   maxOutputTokens: number,
-  withToolChoiceNone: boolean,
+  api: string | undefined,
+  attempt: 1 | 2,
 ): { ok: true; body: Record<string, unknown> } | { ok: false; reason: string } {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return { ok: false, reason: "captured payload is not an object" };
@@ -69,14 +76,26 @@ export function buildProbeBody(
   }
 
   const body: Record<string, unknown> = structuredClone(raw);
+  if (api === "anthropic-messages") {
+    delete body.stream;
+    delete body.stream_options;
+    // thinking must go with a tiny max_tokens: Anthropic-style APIs require
+    // max_tokens > thinking.budget_tokens, and thinking is not part of the
+    // prompt prefix that feeds the cache key.
+    delete body.thinking;
+    body.max_tokens = Math.max(1, Math.floor(maxOutputTokens));
+    if (attempt === 1) body.tool_choice = { type: "none" };
+    else delete body.tool_choice;
+    return { ok: true, body };
+  }
+  // OpenAI-completions style (kimi-openai-completions and friends).
   delete body.stream;
-  // thinking must go with a tiny max_tokens: Anthropic-style APIs require
-  // max_tokens > thinking.budget_tokens, and thinking is not part of the
-  // prompt prefix that feeds the cache key.
+  delete body.stream_options;
   delete body.thinking;
-  body.max_tokens = Math.max(1, Math.floor(maxOutputTokens));
-  if (withToolChoiceNone) body.tool_choice = { type: "none" };
-  else delete body.tool_choice;
+  delete body.store;
+  delete body.tool_choice;
+  body.max_completion_tokens = Math.max(1, Math.floor(maxOutputTokens));
+  if (attempt === 2) delete body.prompt_cache_retention;
   return { ok: true, body };
 }
 
@@ -110,6 +129,9 @@ export function parseUsage(data: unknown): ParsedUsage {
     if (details && typeof details === "object") {
       out.cacheReadTokens = num((details as Record<string, unknown>).cached_tokens);
     }
+  }
+  if (out.cacheReadTokens === 0) {
+    out.cacheReadTokens = num(u.cached_tokens);
   }
   // Anthropic counts cached tokens inside input_tokens; OpenAI-style too.
   // Keep both interpretations consistent for miss detection below.

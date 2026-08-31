@@ -11,7 +11,7 @@ Replayed requests are sent directly to the provider endpoint. They do not pass t
 ## Requirements
 
 - Node ≥ 20, pi ≥ 0.84 (exposes the `before_provider_headers` / `before_provider_request` hooks)
-- `kimi-coding` provider (OAuth or API key), `anthropic-messages` API
+- `kimi-coding` provider (OAuth subscription recommended), `kimi-openai-completions` API
 
 ## Install
 
@@ -63,20 +63,22 @@ All settings persist to `~/.pi/cache-keepalive/state.json`. Statistics are per-s
 
 ## How it works
 
-1. **Capture.** The `before_provider_headers` and `before_provider_request` hooks snapshot the headers and a `structuredClone` of the payload of each real `kimi-coding` request. In-memory only; nothing is written to disk.
-2. **Replay.** While the agent is idle and enabled, the captured request is POSTed to `{baseUrl}/v1/messages` with only terminal parameters changed:
+1. **Capture.** The `before_provider_request` hook snapshots a `structuredClone` of the payload of each real `kimi-coding` request. In-memory only; nothing is written to disk.
+2. **Replay.** While the agent is idle and enabled, the captured request is POSTed to `{baseUrl}/chat/completions` (kimi-openai-completions) with only terminal parameters changed:
 
    | Change | Reason |
    | --- | --- |
-   | remove `stream` | returns usage as a single JSON body |
-   | remove `thinking` | API requires `max_tokens > thinking.budget_tokens`, incompatible with the clamp below |
-   | `max_tokens: 16` | bounds the probe's output cost |
-   | `tool_choice: {type: "none"}` | prevents a tool-call round; dropped with a retry on HTTP 400 |
+   | remove `stream` / `stream_options` | returns usage as a single JSON body |
+   | remove `thinking` | avoids thinking-budget constraints against the output clamp below |
+   | remove `store` | probe output is unused; no need to persist it |
+   | `max_completion_tokens: 16` | bounds the probe's output cost |
+   | HTTP 400 retry | drops `prompt_cache_retention` (a terminal parameter, not part of the prefix) |
 
-   `system`, `messages`, and `tools` are kept byte-identical. These are the only inputs to the provider's prefix-cache key, so the replay matches the existing cache entry and restarts its TTL at cache-read pricing.
-3. **Classification.** Response usage (`cache_read_input_tokens`, falling back to `cached_tokens`) classifies each probe as a hit or a miss. The response is otherwise discarded.
+   `messages`, `tools`, and Kimi's `prompt_cache_key` / `prompt_cache_retention` are kept byte-identical — the inputs to the provider's prefix-cache key — so the replay matches the existing cache entry and restarts its TTL at cache-read pricing. Verified live: a probe against a 48k-token session reports `use.prompt_tokens_details.cached_tokens × 48,116 / 48,116`.
+3. **Authentication.** pi injects the OAuth bearer token after the `before_provider_headers` hook fires, so captured headers usually lack auth. Probes read the current `kimi-coding.access` token from pi's auth store (`~/.pi/agent/auth.json`) at probe time, staying in sync with pi's token refreshes.
+4. **Classification.** Response usage (`prompt_tokens_details.cached_tokens`, falling back to Anthropic-style fields) classifies each probe as a hit or a miss. The response is otherwise discarded.
 
-Headers are forwarded verbatim except hop-by-hop and length headers, which `fetch` manages.
+Captured headers are merged in minus hop-by-hop and length headers; the bearer token always comes from the auth store.
 
 ## Guardrails
 
@@ -100,7 +102,7 @@ On a Kimi subscription, billing is quota-based and USD figures are indicative on
 ## Limitations
 
 - The ~5 minute TTL and the pricing above are observed behavior, not an API contract. The `saved` estimate is informational, not a guaranteed saving.
-- Only the `kimi-coding` provider with `anthropic-messages` API routes is supported. Other providers have different cache-key semantics and are out of scope.
+- Only the `kimi-coding` provider (`kimi-openai-completions` API, with an `anthropic-messages` fallback) is supported. Other providers have different cache-key semantics and are out of scope.
 - Captured payloads and headers live only in process memory; probes are sent only to `https://` endpoints.
 
 ## Development

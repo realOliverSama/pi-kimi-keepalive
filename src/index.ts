@@ -51,6 +51,7 @@ import {
 
 const STATE_DIR = join(homedir(), ".pi", "cache-keepalive");
 const STATE_FILE = join(STATE_DIR, "state.json");
+const AUTH_FILE = join(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "auth.json");
 
 interface PersistedConfig {
   enabled: boolean;
@@ -107,6 +108,7 @@ interface Capture {
   payload: Record<string, unknown>;
   headers: Record<string, string>;
   provider: string;
+  api: string | undefined;
   baseUrl: string;
   cost: Partial<CostPerM> | undefined;
 }
@@ -320,12 +322,21 @@ export default function (pi: ExtensionAPI) {
 
   function isTargetModel(context: ExtensionContext | null): boolean {
     const model = context?.model;
-    return Boolean(
-      model &&
-        model.provider === "kimi-coding" &&
-        model.api === "anthropic-messages" &&
-        typeof model.baseUrl === "string" &&
-        model.baseUrl.length > 0,
+    if (!model || model.provider !== "kimi-coding") return false;
+    if (
+      typeof model.baseUrl !== "string" ||
+      model.baseUrl.length === 0
+    ) {
+      return false;
+    }
+    // kimi-coding currently routes through an OpenAI-completions-compatible
+    // API ("kimi-openai-completions"); accept the anthropic-messages dialect
+    // too in case the provider config changes.
+    const api = (model as { api?: unknown }).api;
+    return (
+      api === "kimi-openai-completions" ||
+      api === "anthropic-messages" ||
+      (typeof api === "string" && api.endsWith("openai-completions"))
     );
   }
 
@@ -394,7 +405,36 @@ export default function (pi: ExtensionAPI) {
     if (!capture) return null;
     const base = capture.baseUrl.replace(/\/+$/, "");
     if (!/^https:\/\//.test(base)) return null;
-    return `${base}/v1/messages`;
+    return capture.api === "anthropic-messages"
+      ? `${base}/v1/messages`
+      : `${base}/chat/completions`;
+  }
+
+  /**
+   * Resolve the probe's Authorization header. pi injects OAuth credentials
+   * (kimi-coding `Authorization: Bearer <access>`) after the
+   * before_provider_headers hook fires, so captured headers usually lack
+   * auth; read the current token from pi's auth store instead. Falls back
+   * to the forwarded captured headers if the token file is unavailable.
+   */
+  function probeHeaders(): Record<string, string> | null {
+    if (!capture) return null;
+    const headers = buildProbeHeaders(capture.headers);
+    if (!headers.authorization) {
+      try {
+        const raw = JSON.parse(readFileSync(AUTH_FILE, "utf8")) as Record<string, unknown>;
+        const entry = (raw["kimi-coding"] ?? null) as { access?: unknown } | null;
+        if (entry && typeof entry.access === "string" && entry.access.length > 0) {
+          headers.authorization = `Bearer ${entry.access}`;
+        } else {
+          debug(`no kimi-coding access token in ${AUTH_FILE}`);
+        }
+      } catch (error) {
+        debug(`auth.json unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (!headers.authorization) return null;
+    return headers;
   }
 
   async function runProbe(): Promise<boolean> {
@@ -403,17 +443,22 @@ export default function (pi: ExtensionAPI) {
     try {
       const endpoint = probeEndpoint();
       if (!endpoint) return false;
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        const built = buildProbeBody(capture.payload, config.maxOutputTokens, attempt === 1);
+      for (let attempt = 1 as 1 | 2; attempt <= 2; attempt++) {
+        const built = buildProbeBody(capture.payload, config.maxOutputTokens, capture.api, attempt);
         if (!built.ok) {
           recordFailure(`captured payload not replayable: ${built.reason}`);
           return false;
         }
         let response: Response;
+        const probeRequestHeaders = probeHeaders();
+        if (!probeRequestHeaders) {
+          recordFailure("no Kimi credentials available for the probe");
+          return false;
+        }
         try {
           response = await fetch(endpoint, {
             method: "POST",
-            headers: buildProbeHeaders(capture.headers),
+            headers: probeRequestHeaders,
             body: JSON.stringify(built.body),
             signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
           });
@@ -427,10 +472,10 @@ export default function (pi: ExtensionAPI) {
           return true;
         }
         debug(`probe attempt ${attempt} -> HTTP ${response.status}: ${text.slice(0, 200)}`);
-        // One retry without tool_choice if the endpoint rejects the probe's
-        // extra parameters; the conversation prefix is never modified.
-        const retryable =
-          response.status === 400 && attempt === 1 && /tool_choice|thinking|stream/i.test(text);
+        // One retry with a further-reduced terminal-parameter set when the
+        // endpoint rejects the probe's extras; the conversation prefix is
+        // never modified.
+        const retryable = response.status === 400 && attempt === 1;
         if (!retryable) {
           recordFailure(`HTTP ${response.status}`);
           return false;
@@ -544,7 +589,7 @@ export default function (pi: ExtensionAPI) {
 
   function statusLines(): string[] {
     const route = capture
-      ? `${capture.provider} @ ${capture.baseUrl}`
+      ? `${capture.provider} (${capture.api ?? "unknown api"}) @ ${capture.baseUrl}`
       : "none yet — probes start after your first real turn";
     return [
       "pi-kimi-keepalive",
@@ -736,6 +781,7 @@ export default function (pi: ExtensionAPI) {
       payload: structuredClone(raw),
       headers: capturedHeaders,
       provider: model.provider,
+      api: (model as { api?: string }).api,
       baseUrl: model.baseUrl ?? "",
       cost: (model.cost ?? undefined) as Partial<CostPerM> | undefined,
     };

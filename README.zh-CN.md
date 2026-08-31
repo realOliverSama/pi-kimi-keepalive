@@ -11,7 +11,7 @@ Kimi 的自动 prompt 缓存 TTL 实测约 5 分钟。TTL 过期后恢复会话�
 ## 环境要求
 
 - Node ≥ 20，pi ≥ 0.84（提供 `before_provider_headers` / `before_provider_request` 钩子）
-- `kimi-coding` provider（OAuth 或 API key），`anthropic-messages` API
+- `kimi-coding` provider（建议 OAuth 订阅），`kimi-openai-completions` API
 
 ## 安装
 
@@ -63,20 +63,21 @@ npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 
 ## 工作机制
 
-1. **捕获**。`before_provider_headers` / `before_provider_request` 钩子快照每条真实 `kimi-coding` 请求的 headers 与 payload（`structuredClone`）。只存内存，不落盘。
-2. **重放**。仅修改终端参数：
+1. **捕获**。`before_provider_request` 钩子快照每条真实 `kimi-coding` 请求的 payload（`structuredClone`）。只存内存，不落盘。
+2. **重放**。捕获的请求 POST 至 `{baseUrl}/chat/completions`（kimi-openai-completions 路由），仅修改终端参数：
 
    | 修改 | 原因 |
    | --- | --- |
-   | 移除 `stream` | 非流式响应中 usage 可直接解析 |
-   | 移除 `thinking` | API 要求 `max_tokens > thinking.budget_tokens`，与下方 max_tokens 收紧不兼容 |
-   | `max_tokens: 16` | 限制探测输出成本 |
-   | `tool_choice: {type: "none"}` | 避免工具调用回合；HTTP 400 时去掉并重试一次 |
+   | 移除 `stream` / `stream_options` | 非流式响应中 usage 可直接解析 |
+   | 移除 `thinking` / `store` | 与输出收紧参数兼容性未知；非前缀组成部分 |
+   | `max_completion_tokens: 16` | 限制探测输出成本 |
+   | HTTP 400 时重试 | 去掉 `prompt_cache_retention`（终端参数，非缓存键） |
 
-   `system` / `messages` / `tools` 保持 byte-identical。这三者是 provider 前缀缓存键的全部输入，重放因此命中既有缓存条目并重置 TTL，按 cache-read 计费。
-3. **判定**。解析响应 usage（`cache_read_input_tokens`，回退 `cached_tokens`）将探测分类为 hit 或 miss；响应其余部分丢弃。
+   `messages` / `tools` / `prompt_cache_key` / `prompt_cache_retention` 保持 byte-identical——这些是 provider 前缀缓存键的输入，重放因此命中既有缓存条目并重置 TTL，按 cache-read 计费。实测对 48k 上下文的探测实现 48,116/48,116 全量命中。
+3. **认证**。pi 在 `before_provider_headers` 钩子之后才注入 OAuth 凭据，捕获的 headers 通常不含认证；探测时从 pi 的凭据存储（`~/.pi/agent/auth.json` 的 `kimi-coding.access`）读取当前 token，与 pi 的自动刷新保持同步。
+4. **判定**。解析响应 usage（`prompt_tokens_details.cached_tokens`，回退 Anthropic 风格字段）将探测分类为 hit 或 miss；响应其余部分丢弃。
 
-Headers 原样转发，仅去除 hop-by-hop 与长度头（由 `fetch` 自行管理）。
+捕获的业务 headers 原样合并（去除 hop-by-hop 与长度头）。
 
 ## 护栏
 
@@ -99,7 +100,7 @@ Kimi 订阅按 quota 计费，USD 数值仅供参考。
 ## 限制
 
 - ~5 分钟 TTL 与上述定价为观测行为，非 API 契约；`saved` 仅为估算。
-- 仅支持 `kimi-coding` + `anthropic-messages` 路由；其他 provider 缓存键语义不同，不在范围内。
+- 仅支持 `kimi-coding`（`kimi-openai-completions` API，含 `anthropic-messages` 回退）；其他 provider 缓存键语义不同，不在范围内。
 - 捕获内容仅存内存；探测仅发往 `https://` 端点。
 
 ## 开发
