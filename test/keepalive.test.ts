@@ -537,19 +537,20 @@ test("first-run wizard fires once on startup, collects guardrails, and can enabl
   clearHomeState();
   const pi = makePi();
   const ctx = makeCtx({
-    inputs: ["45m", "3", "5", "0.5"],
+    inputs: ["45m", "3", "5", "0.5", ""], // last: mode (Esc/empty = default)
     confirms: [true, true], // intro confirm + enable confirm
   });
   factory(pi);
 
   await pi.emit("session_start", { reason: "startup" }, ctx);
 
-  // Four questions in order, each with an explanation in the title.
-  assert.equal(ctx.ui.inputCalls.length, 4);
+  // Five questions in order, each with an explanation in the title.
+  assert.equal(ctx.ui.inputCalls.length, 5);
   assert.match(ctx.ui.inputCalls[0].title, /Max idle cutoff/);
   assert.match(ctx.ui.inputCalls[1].title, /Miss pause threshold/);
   assert.match(ctx.ui.inputCalls[2].title, /Error circuit breaker/);
   assert.match(ctx.ui.inputCalls[3].title, /spend cap/i);
+  assert.match(ctx.ui.inputCalls[4].title, /Probing mode/);
   assert.ok(ctx.ui.confirmCalls.length >= 2);
 
   const state = JSON.parse(readFileSync(statePath(), "utf8"));
@@ -557,6 +558,7 @@ test("first-run wizard fires once on startup, collects guardrails, and can enabl
   assert.equal(state.maxMissStreak, 3);
   assert.equal(state.maxErrorStreak, 5);
   assert.equal(state.spendCapUsd, 0.5);
+  assert.equal(state.mode, "default");
   assert.equal(state.enabled, true);
   assert.equal(state.initialized, true);
 });
@@ -622,4 +624,162 @@ test("configured error breaker raises the failure tolerance (was hardcoded 3)", 
 
   assert.equal(fetchStub.calls.length, 5); // 5 ticks needed before the configured breaker fires
   assert.match(lastNotification(ctx), /paused/);
+});
+
+// ---------------------------------------------------------------------------
+// smart mode
+
+const BIG_INPUT_HIT_USAGE = {
+  usage: { input_tokens: 210_000, output_tokens: 4, cache_read_input_tokens: 208_000 },
+};
+
+test("mode=smart persists and 5 consecutive hits grow the cadence by 30s", async (t) => {
+  clearHomeState();
+  writeState({
+    enabled: false,
+    intervalMs: 7 * 60_000,
+    maxIdleMs: 0,
+    spendCapUsd: 0,
+    minPromptTokens: 512,
+    mode: "smart",
+  });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await pi.command("on", ctx);
+
+  // Five floor hits confirm the 7m cadence and promote it to 7m30s.
+  for (let i = 0; i < 5; i++) {
+    await pi.command("now", ctx);
+    await settle(pi, ctx);
+    await sleep(20);
+  }
+  assert.equal(fetchStub.calls.length, 5);
+  const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.mode, "smart");
+  assert.equal(persisted.intervalMs, 7 * 60_000 + 30_000);
+});
+
+test("one miss steps back to the last confirmed cadence without pausing", async (t) => {
+  clearHomeState();
+  writeState({
+    enabled: false,
+    intervalMs: 7 * 60_000 + 30_000,
+    maxIdleMs: 0,
+    spendCapUsd: 0,
+    minPromptTokens: 512,
+    mode: "smart",
+  });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  fetchStub.queue.push({ status: 200, body: MISS_USAGE });
+  factory(pi);
+  await captureOnce(pi, ctx);
+
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  await settle(pi, ctx);
+  assert.equal(fetchStub.calls.length, 1);
+  const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.intervalMs, 7 * 60_000);
+  assert.ok(!lastNotification(ctx).match(/paused/));
+});
+
+test("smart mode pauses only after two consecutive misses at the floor", async (t) => {
+  clearHomeState();
+  writeState({
+    enabled: false,
+    intervalMs: 7 * 60_000,
+    maxIdleMs: 0,
+    spendCapUsd: 0,
+    minPromptTokens: 512,
+    mode: "smart",
+  });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  fetchStub.queue.push({ status: 200, body: MISS_USAGE });
+  fetchStub.queue.push({ status: 200, body: MISS_USAGE });
+  factory(pi);
+  await captureOnce(pi, ctx);
+
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  assert.ok(!lastNotification(ctx).match(/paused/)); // first floor miss: keep going
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  assert.match(lastNotification(ctx), /paused/);
+});
+
+test("smart mode freezes growth and reverts to the floor above 200k context", async (t) => {
+  clearHomeState();
+  writeState({
+    enabled: false,
+    intervalMs: 7 * 60_000 + 30_000,
+    maxIdleMs: 0,
+    spendCapUsd: 0,
+    minPromptTokens: 512,
+    mode: "smart",
+  });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  fetchStub.queue.push({ status: 200, body: BIG_INPUT_HIT_USAGE });
+  fetchStub.queue.push({ status: 200, body: BIG_INPUT_HIT_USAGE });
+  factory(pi);
+  await captureOnce(pi, ctx);
+
+  // First big hit reverts above-floor cadence to the floor…
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  let persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.intervalMs, 7 * 60_000);
+  // …and further big-context hits never re-promote it.
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.intervalMs, 7 * 60_000);
+});
+
+test("interval= is rejected while smart mode manages the cadence", async (t) => {
+  clearHomeState();
+  writeState({
+    enabled: false,
+    intervalMs: 7 * 60_000,
+    maxIdleMs: 0,
+    spendCapUsd: 0,
+    minPromptTokens: 512,
+    mode: "smart",
+  });
+  const pi = makePi();
+  const ctx = makeCtx();
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await pi.command("interval=9m", ctx);
+  const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.intervalMs, 7 * 60_000);
+  assert.match(lastNotification(ctx), /smart mode manages the cadence/);
 });

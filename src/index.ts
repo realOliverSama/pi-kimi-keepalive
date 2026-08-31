@@ -68,6 +68,8 @@ interface PersistedConfig {
   maxMissStreak: number;
   /** Consecutive failed probes (network/server errors) before probing pauses. */
   maxErrorStreak: number;
+  /** "default" = fixed interval; "smart" = adaptive cadence that grows while probes keep hitting. */
+  mode: "default" | "smart";
   /** True once the first-run setup wizard has completed (or been skipped). */
   initialized: boolean;
 }
@@ -86,8 +88,16 @@ const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
   spendCapUsd: 1.0,
   maxMissStreak: 1,
   maxErrorStreak: 3,
+  mode: "default",
   initialized: false,
 });
+
+// smart-mode constants
+const SMART_BASE_MS = 7 * 60_000; // starting cadence (user-verified to still hit)
+const SMART_STEP_MS = 30_000; // +30s per 5-hit confirmation
+const SMART_CONFIRM_HITS = 5;
+const SMART_MAX_CONTEXT_TOKENS = 200_000; // context cap: grow only below this
+const SMART_FLOOR_MISSES_TO_PAUSE = 2; // misses needed at the floor cadence before pausing
 
 const MIN_INTERVAL_MS = 30_000;
 const PROBE_TIMEOUT_MS = 30_000;
@@ -99,7 +109,9 @@ const HELP_TEXT = [
   "  /keepalive on|off         enable / disable (persisted)",
   "  /keepalive now            one manual probe (bypasses pauses)",
   "  /keepalive resume         clear a sticky pause",
-  "  /keepalive interval=4m45s probe cadence (>= 30s; <= 5m stays inside the cache TTL)",
+  "  /keepalive mode=smart     adaptive cadence (7m floor, +30s per 5-hit confirmation, back off on miss)",
+  "  /keepalive mode=default   fixed cadence (the interval= value)",
+  "  /keepalive interval=4m45s probe cadence (default mode; >= 30s; <= 5m stays inside the cache TTL)",
   "  /keepalive maxidle=30m    stop probing after this idle time (0 = never stop)",
   "  /keepalive miss=1         pause after N consecutive cache misses",
   "  /keepalive errors=3       pause after N consecutive probe failures",
@@ -144,7 +156,10 @@ export default function (pi: ExtensionAPI) {
   let pausedReason: string | null = null;
   let missStreak = 0;
   let errorStreak = 0;
-
+  // smart-mode runtime state (cadence itself lives in config.intervalMs, persisted)
+  let smartHitStreak = 0;
+  let smartFloorMisses = 0;
+  let lastProbeInputTokens = 0;
   const stats: Stats = { probes: 0, hits: 0, misses: 0, errors: 0, savedUsd: 0, spendUsd: 0 };
 
   // ---------- persistence ----------
@@ -177,6 +192,7 @@ export default function (pi: ExtensionAPI) {
               : DEFAULT_CONFIG.spendCapUsd,
         maxMissStreak: int(raw.maxMissStreak, DEFAULT_CONFIG.maxMissStreak, 1),
         maxErrorStreak: int(raw.maxErrorStreak, DEFAULT_CONFIG.maxErrorStreak, 1),
+        mode: raw.mode === "smart" ? "smart" : "default",
           initialized: raw.initialized === true,
       };
     } catch {
@@ -217,7 +233,7 @@ export default function (pi: ExtensionAPI) {
       config.initialized = true;
       persistConfig();
       notify(
-        "Setup skipped — defaults kept (interval 7m, maxidle 30m, miss 1, errors 3, cap $1.00). " +
+        "Setup skipped — defaults kept (mode default/7m, maxidle 30m, miss 1, errors 3, cap $1.00). " +
           "Run /keepalive setup to configure later, /keepalive on to enable.",
         "info",
       );
@@ -225,9 +241,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // 1/4 — max idle cutoff
+    // 1/5 — max idle cutoff
     const maxIdleRaw = await wizardCtx.ui.input(
-      "Step 1/4 — Max idle cutoff (now " + formatDuration(config.maxIdleMs) + ")\n" +
+      "Step 1/5 — Max idle cutoff (now " + formatDuration(config.maxIdleMs) + ")\n" +
         "Stop probing once you have been idle longer than this, so a session left overnight " +
         "does not keep spending quota. Examples: 30m, 1h, 2h — or 0 to never stop.\n" +
         "Leave empty / press Esc to keep the default (30m).",
@@ -246,9 +262,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // 2/4 — miss pause threshold
+    // 2/5 — miss pause threshold
     const missRaw = await wizardCtx.ui.input(
-      "Step 2/4 — Miss pause threshold (now " + config.maxMissStreak + ")\n" +
+      "Step 2/5 — Miss pause threshold (now " + config.maxMissStreak + ")\n" +
         "Pause probing after this many consecutive probes that did NOT hit the prompt cache " +
         "(a cache hit resets the count). A high cache-read price with no hits means the " +
         "provider's caching behaviour changed; pausing keeps you from burning quota blindly.",
@@ -263,9 +279,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // 3/4 — error circuit breaker
+    // 3/5 — error circuit breaker
     const errorRaw = await wizardCtx.ui.input(
-      "Step 3/4 — Error circuit breaker (default " + config.maxErrorStreak + ")\n" +
+      "Step 3/5 — Error circuit breaker (default " + config.maxErrorStreak + ")\n" +
         "Pause probing after this many consecutive failed probes (network errors, HTTP 5xx). " +
         "Auth failures (HTTP 401/403) always pause immediately regardless of this value.",
       String(config.maxErrorStreak),
@@ -279,9 +295,9 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // 4/4 — spend cap
+    // 4/5 — spend cap
     const spendRaw = await wizardCtx.ui.input(
-      "Step 4/4 — Session spend cap in USD (default " +
+      "Step 4/5 — Session spend cap in USD (default " +
         formatUsd(DEFAULT_CONFIG.spendCapUsd ?? 1.0) +
         ")\n" +
         "Ceiling on the estimated USD cost of probes in this session. A probe costs roughly " +
@@ -295,6 +311,26 @@ export default function (pi: ExtensionAPI) {
         notify("Invalid USD value — keeping the default cap", "error");
       } else {
         config.spendCapUsd = usd === 0 ? null : usd;
+      }
+    }
+
+    // 5/5 — probing mode
+    const modeRaw = await wizardCtx.ui.input(
+      "Step 5/5 — Probing mode (now " + config.mode + ")\n" +
+        "default: probes run at the fixed interval above.\n" +
+        "smart: starts at 7m; after 5 consecutive hits (context ≤ 200k) the cadence grows by 30s, " +
+        "and one miss steps back to the last confirmed value — it self-tunes toward the real cache TTL " +
+        "to minimize probe spend.\n" +
+        "Type smart to enable; leave empty / press Esc for default.",
+      "",
+    );
+    if (modeRaw !== undefined) {
+      const v = modeRaw.trim().toLowerCase();
+      if (v === "smart" || v === "default") {
+        config.mode = v;
+        if (v === "smart" && config.intervalMs < SMART_BASE_MS) config.intervalMs = SMART_BASE_MS;
+      } else if (v !== "") {
+        notify(`Unknown mode "${modeRaw}" — keeping ${config.mode}`, "error");
       }
     }
 
@@ -314,6 +350,7 @@ export default function (pi: ExtensionAPI) {
     persistConfig();
     notify(
       "pi-kimi-keepalive configured:\n" +
+        `  mode:         ${config.mode}${config.mode === "smart" ? ` (starting at ${formatDuration(config.intervalMs)})` : ` (fixed ${formatDuration(config.intervalMs)})`}\n` +
         `  maxidle:      ${config.maxIdleMs === 0 ? "never stop" : formatDuration(config.maxIdleMs)}\n` +
         `  miss pause:   after ${config.maxMissStreak} consecutive cache misses\n` +
         `  error breaker: ${config.maxErrorStreak} consecutive failures\n` +
@@ -507,21 +544,31 @@ export default function (pi: ExtensionAPI) {
     if (!capture) return;
     stats.probes += 1;
     stats.spendUsd += estimateProbeSpendUsd(usage, capture.cost);
+    lastProbeInputTokens = usage.inputTokens;
 
     if (!isCacheMiss(usage.inputTokens, usage.cacheReadTokens, config.minPromptTokens)) {
       stats.hits += 1;
       stats.savedUsd += estimateSavedUsd(usage.cacheReadTokens, capture.cost);
       missStreak = 0;
       errorStreak = 0;
+      smartFloorMisses = 0;
       debug(
         `probe hit: cache_read=${usage.cacheReadTokens} input=${usage.inputTokens} saved=${stats.savedUsd.toFixed(4)}`,
       );
+      if (config.mode === "smart") {
+        smartAdaptAfterHit(usage.inputTokens);
+      }
     } else {
       stats.misses += 1;
-      missStreak += 1;
-      debug(`probe miss #${missStreak}: cache_read=0 input=${usage.inputTokens}`);
-      if (missStreak >= config.maxMissStreak) {
-        pause("probes stopped hitting the prefix cache; waiting for your next real turn");
+      debug(`probe miss: cache_read=0 input=${usage.inputTokens}`);
+      if (config.mode === "smart") {
+        smartAdaptAfterMiss();
+      } else {
+        missStreak += 1;
+        debug(`probe miss #${missStreak}: cache_read=0 input=${usage.inputTokens}`);
+        if (missStreak >= config.maxMissStreak) {
+          pause("probes stopped hitting the prefix cache; waiting for your next real turn");
+        }
       }
     }
 
@@ -532,6 +579,74 @@ export default function (pi: ExtensionAPI) {
     ) {
       pause(
         `probe spend ${formatUsd(stats.spendUsd)} reached the cap ${formatUsd(config.spendCapUsd)}`,
+      );
+    }
+  }
+
+  /**
+   * smart-mode cadence adaptation.
+   *
+   * config.intervalMs doubles as the persisted "last confirmed cadence":
+   * promotion only ever happens after SMART_CONFIRM_HITS consecutive hits, so
+   * the value on disk is always one the cache has actually held for. A miss
+   * steps back 30s to that last confirmed value (never below the 7m floor).
+   * Contexts above 200k tokens are never pushed upward and immediately revert
+   * to the floor cadence, because a miss there costs too much full-price
+   * input to risk.
+   *
+   * Floor misses (a miss at 7m means the cache is younger than the starting
+   * cadence — server TTL changed or account trouble) pause after
+   * SMART_FLOOR_MISSES_TO_PAUSE consecutive occurrences.
+   */
+  function smartAdaptAfterHit(inputTokens: number): void {
+    if (inputTokens > SMART_MAX_CONTEXT_TOKENS) {
+      // Too expensive to experiment; drop to floor and stop growing.
+      if (config.intervalMs > SMART_BASE_MS) {
+        config.intervalMs = SMART_BASE_MS;
+        persistConfig();
+        notify(
+          `smart: context ${inputTokens} tokens exceeds ${SMART_MAX_CONTEXT_TOKENS / 1000}k — cadence back to the 7m floor`,
+          "info",
+        );
+      }
+      smartHitStreak = 0;
+      updateUi();
+      return;
+    }
+    smartHitStreak += 1;
+    if (smartHitStreak < SMART_CONFIRM_HITS) return;
+    const roomUnderMaxIdle =
+      config.maxIdleMs === 0 || config.intervalMs + SMART_STEP_MS < config.maxIdleMs;
+    if (roomUnderMaxIdle) {
+      config.intervalMs += SMART_STEP_MS; // 5-hit-confirmed value stays on disk
+      persistConfig();
+      debug(
+        `smart: ${smartHitStreak} consecutive hits — cadence grows to ${formatDuration(config.intervalMs)}`,
+      );
+    }
+    smartHitStreak = 0;
+    updateUi();
+  }
+
+  function smartAdaptAfterMiss(): void {
+    smartHitStreak = 0;
+    if (config.intervalMs > SMART_BASE_MS) {
+      // Step back to the last confirmed cadence.
+      config.intervalMs = Math.max(SMART_BASE_MS, config.intervalMs - SMART_STEP_MS);
+      persistConfig();
+      notify(
+        `smart: cache miss — cadence back to ${formatDuration(config.intervalMs)}`,
+        "info",
+      );
+      updateUi();
+      return;
+    }
+    // Already at the floor: repeated misses there mean the cache is gone.
+    smartFloorMisses += 1;
+    debug(`smart: floor miss #${smartFloorMisses}`);
+    if (smartFloorMisses >= SMART_FLOOR_MISSES_TO_PAUSE) {
+      pause(
+        `${smartFloorMisses} consecutive misses at the 7m floor cadence; waiting for your next real turn`,
       );
     }
   }
@@ -600,6 +715,7 @@ export default function (pi: ExtensionAPI) {
       "pi-kimi-keepalive",
       `  state:     ${config.enabled ? "on" : "off"}${pausedReason ? ` (paused: ${pausedReason})` : ""}`,
       `  capture:   ${route}`,
+      `  mode: ${config.mode}${config.mode === "smart" ? ` · cadence ${formatDuration(config.intervalMs)}${lastProbeInputTokens > SMART_MAX_CONTEXT_TOKENS ? ` · context ${lastProbeInputTokens.toLocaleString()} > cap, frozen at floor` : ""}` : " (fixed via interval=)"}`,
       `  interval:  ${formatDuration(config.intervalMs)} · maxidle ${config.maxIdleMs === 0 ? "off" : formatDuration(config.maxIdleMs)} · minPromptTokens ${config.minPromptTokens} · maxOutput ${config.maxOutputTokens}`,
       `  spend cap: ${config.spendCapUsd === null ? "none" : formatUsd(config.spendCapUsd)} · est. probe spend ${formatUsd(stats.spendUsd)}`,
       `  probes:    ${stats.probes} (hits ${stats.hits}, misses ${stats.misses}, errors ${stats.errors})`,
@@ -656,9 +772,40 @@ export default function (pi: ExtensionAPI) {
             pausedReason = null;
             missStreak = 0;
             errorStreak = 0;
+            smartHitStreak = 0;
+            smartFloorMisses = 0;
             notify("keepalive resumed", "info");
             break;
+          case "mode": {
+            const next = value === "smart" || value === "default" ? value : null;
+            if (next === null) {
+              notify("usage: /keepalive mode=smart (adaptive) or mode=default (fixed)", "error");
+              break;
+            }
+            config.mode = next;
+            if (next === "smart") {
+              // smart manages the cadence itself; snap back to its floor.
+              if (config.intervalMs < SMART_BASE_MS) config.intervalMs = SMART_BASE_MS;
+              smartHitStreak = 0;
+              smartFloorMisses = 0;
+              notify(
+                `mode=smart — starting at ${formatDuration(config.intervalMs)}; +30s per ${SMART_CONFIRM_HITS} hits (context ≤ ${SMART_MAX_CONTEXT_TOKENS / 1000}k), one miss steps back`,
+                "info",
+              );
+            } else {
+              smartHitStreak = 0;
+              smartFloorMisses = 0;
+              notify("mode=default — fixed cadence via /keepalive interval=<duration>", "info");
+            }
+            persistConfig();
+            updateUi();
+            break;
+          }
           case "interval": {
+            if (config.mode === "smart") {
+              notify("smart mode manages the cadence itself — use /keepalive mode=default to set it manually", "warning");
+              break;
+            }
             const ms = value !== undefined ? parseDurationMs(value) : null;
             if (ms === null || ms < MIN_INTERVAL_MS) {
               notify(`/keepalive interval=${value ?? "?"} rejected — minimum 30s, e.g. interval=4m`, "error");

@@ -30,16 +30,33 @@ npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 
 ## 初始化
 
-首次启动（`~/.pi/cache-keepalive/state.json` 不存在）且有交互 UI 时，扩展运行初始化向导配置四项护栏。提示符留空或按 Esc 保留默认值；之后可用 `/keepalive setup` 重新运行；headless 会话自动跳过并保留默认值。
+首次启动（`~/.pi/cache-keepalive/state.json` 不存在）且有交互 UI 时，扩展运行初始化向导配置五项设置。提示符留空或按 Esc 保留默认值；之后可用 `/keepalive setup` 重新运行；headless 会话自动跳过并保留默认值。
 
 | 步骤 | 设置项 | 命令 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | 1 | Max idle cutoff | `maxidle` | `30m` | 空闲超过该时长后停止探测；`0` 表示不设限 |
-| 2 | Miss pause threshold | `miss` | `2` | 连续 N 次探测未命中前缀缓存后暂停；命中会重置计数 |
+| 2 | Miss pause threshold | `miss` | `1` | 连续 N 次探测未命中前缀缓存后暂停；命中会重置计数。仅在 `default` 模式下生效 |
 | 3 | Error circuit breaker | `errors` | `3` | 连续 N 次探测失败（网络错误、HTTP 5xx）后暂停；HTTP 401/403 不受此值约束，直接暂停 |
 | 4 | Session spend cap | `cap` | `$1.00` | 会话探测花费（估算 USD）上限；`0` 表示不设上限 |
+| 5 | Probing mode | `mode` | `default` | `default` 固定间隔；`smart` 自适应（见下文） |
 
 向导结束时询问是否立即启用 keepalive。探测在下一次真实请求（完成捕获）之后开始。全部配置持久化到 `~/.pi/cache-keepalive/state.json`。
+
+## 探测模式
+
+两种模式共用一套护栏，区别仅在间隔的确定方式。
+
+**`default`（默认模式）**——间隔固定为 `interval=` 所设值，默认 **7 分钟**——刻意超过 ~5 分钟的缓存 TTL。7 分钟的探测永远不能命中：以全价输入运行一次、确认缓存已过期，默认 `miss=1` 随即停止探测，因此最坏情况是每个空闲期仅一次全价冷读。若想保持会话常热，可把间隔设在 TTL 之内（`/keepalive interval=4m45s`）：每次探测按缓存读价计费（约为全价的 1/10），循环持续到 `maxidle` 截断。
+
+**`smart`（`/keepalive mode=smart`）**——不猜测 TTL，而是自适应逼近真实值：
+
+1. 从 **7 分钟**起跳。
+2. **连续 5 次命中**后该间隔即被确认，档位 **+30s**。只有确认过的值才会持久化，因此 `~/.pi/cache-keepalive/state.json` 中始终保存的是实测可连续命中的最大档位。
+3. 一次 **miss** 立即把档位回退 **30s** 到最近确认值（至多退到 7m 下限），继续探测并持久化新值。
+4. **上下文保护：** 只有最近一次探测的 prompt tokens ≤ **200k** 才允许升档；一旦超过，档位立即回退至 7m 下限并冻结升档（200k+ 上下文一次全价 miss 代价太高，不冒这个险）。
+5. 在 **7m 下限**连续 2 次 miss 才暂停探测——说明活缓存已短于起跳间隔；下次真实轮次后 `resume` 可重新启动。
+
+因此档位会振荡在真实 TTL 下方一点：大多数探测按缓存读价计费，全价探测只在每次升档试标时偶尔发生一次。
 
 ## 命令
 
@@ -49,7 +66,9 @@ npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 /keepalive on|off           启用 / 停用（持久化）
 /keepalive now              手动探测一次（绕过暂停）
 /keepalive resume           清除 sticky 暂停
-/keepalive interval=4m45s   探测间隔（≥ 30s；应 ≤ 5m 以保持缓存命中）
+/keepalive mode=smart       自适应间隔（下限 7m；每 5 连中 +30s；miss 退 30s）
+/keepalive mode=default     固定间隔（即 interval= 的值）
+/keepalive interval=4m45s   default 模式下的探测间隔（≥ 30s；应 ≤ 5m 以保持缓存命中）
 /keepalive maxidle=30m      空闲上限（0 = 不设限）
 /keepalive miss=1           连续 N 次缓存 miss 后暂停
 /keepalive errors=3         连续 N 次探测失败后熔断

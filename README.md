@@ -30,18 +30,33 @@ After the package is published to npm: `pi install npm:pi-kimi-keepalive`.
 
 ## Setup
 
-On the first start with no `~/.pi/cache-keepalive/state.json` present and an interactive UI, the extension runs a setup wizard that configures the four guardrails below. Leaving a prompt empty or pressing Esc keeps the default. The wizard can be rerun with `/keepalive setup`; in headless sessions it is skipped and defaults are kept.
+On the first start with no `~/.pi/cache-keepalive/state.json` present and an interactive UI, the extension runs a setup wizard that configures the five settings below. Leaving a prompt empty or pressing Esc keeps the default. The wizard can be rerun with `/keepalive setup`; in headless sessions it is skipped and defaults are kept.
 
 | Step | Setting | Command | Default | Description |
 | --- | --- | --- | --- | --- |
 | 1 | Max idle cutoff | `maxidle` | `30m` | Probing stops after this much idle time; `0` disables the cutoff. |
-| 2 | Miss pause threshold | `miss` | `1` | Pause after N consecutive probes that do not hit the prompt cache. A hit resets the count. |
+| 2 | Miss pause threshold | `miss` | `1` | Pause after N consecutive probes that do not hit the prompt cache. A hit resets the count. Applies in `default` mode. |
 | 3 | Error circuit breaker | `errors` | `3` | Pause after N consecutive probe failures (network errors, HTTP 5xx). HTTP 401/403 always pauses immediately. |
 | 4 | Session spend cap | `cap` | `$1.00` | Ceiling on estimated USD probe spend per session; `0` removes the cap. |
+| 5 | Probing mode | `mode` | `default` | `default` keeps the fixed cadence; `smart` self-tunes it (below). |
 
 The wizard ends with a prompt to enable keepalive. Probing starts after the next real turn, which provides the captured request.
 
-Two operating points are worth knowing. The default cadence is **7 minutes** — deliberately past the ~5-minute cache TTL. A 7-minute probe never hits the cache: it runs once at full input price, confirms the cache has expired, and the default `miss=1` stops probing immediately, so the worst case is a single cold read per idle period. For an always-warm session instead, set a cadence inside the TTL (`/keepalive interval=4m45s`): every probe is then billed at cache-read rates (~1/10 of full price) and the loop keeps running until `maxidle` cuts it off.
+## Probing modes
+
+Two modes share the same guardrails; they differ in how the cadence is chosen.
+
+**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **7 minutes** by default — deliberately past the ~5-minute cache TTL. A 7-minute probe never hits the cache: it runs once at full input price, confirms the cache has expired, and the default `miss=1` stops probing immediately, so the worst case is a single cold read per idle period. For an always-warm session instead, set a cadence inside the TTL (`/keepalive interval=4m45s`): every probe is then billed at cache-read rates (~1/10 of full price) and the loop keeps running until `maxidle` cuts it off.
+
+**`smart` (`/keepalive mode=smart`)** — self-tunes the cadence toward the real cache TTL instead of guessing it:
+
+1. Starts at **7 minutes**.
+2. After **5 consecutive hits** the cadence is confirmed and the value grows by **+30s**. Only confirmed values are persisted, so `~/.pi/cache-keepalive/state.json` always holds the largest cadence with observed consecutive hits.
+3. A **miss** immediately steps the cadence back **30s** to the last confirmed value (and to the 7m floor at most), keeps probing, and persists the new value.
+4. **Context guard:** growth only happens while the last probe saw ≤ **200k prompt tokens**; the first probe above that immediately reverts the cadence to the 7m floor and keeps it there (a missed probe on a 200k+ context is too expensive to risk).
+5. Two consecutive misses **at the 7m floor** pause probing — the live cache is younger than the starting cadence, and `resume` after a real turn re-arms.
+
+The cadence therefore oscillates just under the real TTL: most probes are cache-read priced, and full-price probes happen only once per growth attempt that overshoots.
 
 ## Commands
 
@@ -51,7 +66,9 @@ Two operating points are worth knowing. The default cadence is **7 minutes** —
 /keepalive on|off           enable / disable (persisted)
 /keepalive now              one manual probe (bypasses pauses)
 /keepalive resume           clear a sticky pause
-/keepalive interval=4m45s   probe cadence (≥ 30s; ≤ 5m to stay inside the cache TTL)
+/keepalive mode=smart       adaptive cadence (7m floor; +30s per 5-hit confirmation; −30s on miss)
+/keepalive mode=default     fixed cadence (the interval= value)
+/keepalive interval=4m45s   probe cadence in default mode (≥ 30s; ≤ 5m to stay inside the cache TTL)
 /keepalive maxidle=30m      idle cutoff (0 = disabled)
 /keepalive miss=1           pause after N consecutive cache misses
 /keepalive errors=3         pause after N consecutive probe failures
