@@ -1,97 +1,116 @@
 # pi-kimi-keepalive
 
-为 [Pi coding agent](https://github.com/earendil-works/pi-coding-agent) 中的 Kimi（`kimi-coding` provider）会话保持 **prompt 缓存不过期**。
+English | [中文文档](README.zh-CN.md)
 
-[English](README.md) | 中文文档
+Prompt-cache keepalive for [Kimi](https://www.kimi.com/) (`kimi-coding` provider) sessions in the [Pi coding agent](https://github.com/earendil-works/pi-coding-agent).
 
-## 背景
+Kimi 的自动 prompt 缓存 TTL 实测约 5 分钟。TTL 过期后恢复会话时，整个上下文以全价 input（$3 / 1M）重新计算。本扩展捕获最后一条真实 provider 请求，在会话空闲期间以固定间隔将其重放至同一端点，使缓存前缀在 TTL 内保持有效，后续请求按 cache-read 价格（$0.3 / 1M）计费。
 
-使用 Kimi K3 订阅（provider `kimi-coding`）时，其自动 prompt 缓存的 TTL 实测约 **5 分钟**（非官方承诺）。在 pi 里思考、看代码、开会超过 5–10 分钟后再次发消息，整个会话上下文会以全价 input 重新读取——上下文越长越贵。
+重放请求直接发送到 provider 端点，不经过 Pi 会话管道：不产生合成消息、不产生模型回合、不改动对话历史，仅在界面上展示聚合统计。
 
-手动对策（每 5 分钟发一条最小 prompt）确实有效，但每条消息都进入会话历史，永久污染上下文。
+## 环境要求
 
-## 方案对比
-
-| 方案 | 保缓存 | 污染上下文 | 说明 |
-| --- | --- | --- | --- |
-| 手动每 5 分钟发 prompt | ✅ | ✅ 真实消息 | 纯手工，无法坚持 |
-| [pi-idle-time](https://github.com/clankercode/pi-idle-time) | ✅ | ✅ 真实 turn | 发 `[cache keepalive] {time}`，模型真实回复，上下文无限增长 |
-| [pi-warm-cache](https://github.com/ribbons-digital/pi-warm-cache) | ✅ | ❌ | fail-closed：只对注册为 `anthropic-messages` 且带 `cacheControlFormat === "anthropic"` 的路由生效，**kimi-coding 不满足，默认不工作** |
-| **pi-kimi-keepalive（本项目）** | ✅ | ❌ | 重放最后一条真实请求（前缀 byte-identical），带完整护栏 |
-
-## 工作机制
-
-1. **捕获（只读）**。通过 `before_provider_headers` / `before_provider_request` 钩子拿到最后一条真实 provider 请求的完整 payload（system/messages/tools，含缓存标记）与认证 headers。只在内存中，**不落盘**。
-2. **重放**。空闲时把捕获的请求 POST 到 `{baseUrl}/v1/messages`，只改终端参数：去掉 `stream` / `thinking`、`max_tokens` 收紧（默认 16）、attempt 1 附加 `tool_choice: {type:"none"}`（若 400 报错则去掉重试一次）。**对话前缀一字节不改**，因此命中同一份自动前缀缓存，把 TTL 重新计满，按 cache-read 价格收费。
-3. **零侵入**。探测绝不进入 Pi 会话：没有合成 user message、没有模型回合、没有工具调用。只有聚合统计（hit / miss / 预估节省）展示给你。
-
-## 护栏
-
-- agent 忙碌时不探测（`agent_settled` 重新 arm）；
-- `maxidle`（默认 30 分钟）后停止探测——不会挂机过夜空烧；
-- 连续 2 次缓存 miss 暂停；连续 3 次错误或 HTTP 401/403 暂停；
-- 会话探测花费超过 `cap`（默认 $1.00）后暂停；
-- 下一条真实请求会自动解除一切 sticky 暂停、重新捕获凭据；
-- 定时器 `unref()`，绝不阻止进程退出。
+- Node ≥ 20，pi ≥ 0.84（提供 `before_provider_headers` / `before_provider_request` 钩子）
+- `kimi-coding` provider（OAuth 或 API key），`anthropic-messages` API
 
 ## 安装
 
 ```bash
-pi install npm:pi-kimi-keepalive
+git clone https://github.com/realoliversama/pi-kimi-keepalive
+pi install /path/to/pi-kimi-keepalive
 ```
 
-或本地试跑：
+单次会话试运行（不安装）：
 
 ```bash
-git clone https://github.com/oliverlyu/pi-kimi-keepalive
-pi -e ./pi-kimi-keepalive/src/index.ts
+pi -e /path/to/pi-kimi-keepalive/src/index.ts
 ```
 
-需要 Node ≥ 20，pi ≥ 0.84（提供 `before_provider_headers` / `before_provider_request` 钩子）。
+npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 
-## 使用
+## 初始化
+
+首次启动（`~/.pi/cache-keepalive/state.json` 不存在）且有交互 UI 时，扩展运行初始化向导配置四项护栏。提示符留空或按 Esc 保留默认值；之后可用 `/keepalive setup` 重新运行；headless 会话自动跳过并保留默认值。
+
+| 步骤 | 设置项 | 命令 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| 1 | Max idle cutoff | `maxidle` | `30m` | 空闲超过该时长后停止探测；`0` 表示不设限 |
+| 2 | Miss pause threshold | `miss` | `2` | 连续 N 次探测未命中前缀缓存后暂停；命中会重置计数 |
+| 3 | Error circuit breaker | `errors` | `3` | 连续 N 次探测失败（网络错误、HTTP 5xx）后暂停；HTTP 401/403 不受此值约束，直接暂停 |
+| 4 | Session spend cap | `cap` | `$1.00` | 会话探测花费（估算 USD）上限；`0` 表示不设上限 |
+
+向导结束时询问是否立即启用 keepalive。探测在下一次真实请求（完成捕获）之后开始。全部配置持久化到 `~/.pi/cache-keepalive/state.json`。
+
+## 命令
 
 ```
-/keepalive                查看状态
-/keepalive on|off         启用 / 停用（持久化到 ~/.pi/cache-keepalive/state.json）
-/keepalive now            手动探测一次（绕过暂停）
-/keepalive resume         清除 sticky 暂停
-/keepalive interval=4m    探测间隔（≥ 30s）
-/keepalive maxidle=30m    空闲多久后彻底停探测（0 = 不设限）
-/keepalive cap=1.0        单会话探测花费上限（USD，0 = 无上限）
-/keepalive token=512      判定 miss 的最小 prompt token 数
-/keepalive maxoutput=16   探测的 max_tokens
-/keepalive reset          清零统计
+/keepalive                  查看状态
+/keepalive setup            重新运行初始化向导
+/keepalive on|off           启用 / 停用（持久化）
+/keepalive now              手动探测一次（绕过暂停）
+/keepalive resume           清除 sticky 暂停
+/keepalive interval=4m      探测间隔（≥ 30s）
+/keepalive maxidle=30m      空闲上限（0 = 不设限）
+/keepalive miss=2           连续 N 次缓存 miss 后暂停
+/keepalive errors=3         连续 N 次探测失败后熔断
+/keepalive cap=1.0          会话探测花费上限（USD，0 = 无上限）
+/keepalive token=512        判定 miss 的最小 prompt token 数
+/keepalive maxoutput=16     探测 max_tokens
+/keepalive reset            清零会话统计
 ```
 
-默认：**opt-in**（需 `/keepalive on`）、间隔 4 分钟（实测 TTL ≈ 5 分钟，留余量）、maxidle 30 分钟、cap $1.00。调试日志设 `PI_KEEPALIVE_DEBUG=1` 输出到 stderr。
+统计（hits / misses / spend）为会话级；配置项持久化。`PI_KEEPALIVE_DEBUG=1` 输出调试日志到 stderr。
 
-## 成本模型
+## 工作机制
 
-Kimi K3 单价（$/1M tokens）：input 3 · output 15 · **cache read 0.3**。
+1. **捕获**。`before_provider_headers` / `before_provider_request` 钩子快照每条真实 `kimi-coding` 请求的 headers 与 payload（`structuredClone`）。只存内存，不落盘。
+2. **重放**。仅修改终端参数：
 
-- 一次 **hit** 探测 ≈ 整个上下文按 cache-read 计费：50k tokens ≈ $0.015，100k ≈ $0.03。
-- 一次 **miss** 探测 = 全价重读上下文 —— 连续 2 次即暂停探测。
-- K3 的 cache *write* 为 $0，所以 probe 命中时几乎没有额外成本。
-- 订阅（OAuth）用户按 quota 计费，USD 数字仅供参考。
+   | 修改 | 原因 |
+   | --- | --- |
+   | 移除 `stream` | 非流式响应中 usage 可直接解析 |
+   | 移除 `thinking` | API 要求 `max_tokens > thinking.budget_tokens`，与下方 max_tokens 收紧不兼容 |
+   | `max_tokens: 16` | 限制探测输出成本 |
+   | `tool_choice: {type: "none"}` | 避免工具调用回合；HTTP 400 时去掉并重试一次 |
 
-挂机时每小时 ≈ 15 次探测 × $0.03 ≈ $0.45，远低于回来后一次冷恢复的全价重读。`maxidle` 与 `cap` 用于封顶。
+   `system` / `messages` / `tools` 保持 byte-identical。这三者是 provider 前缀缓存键的全部输入，重放因此命中既有缓存条目并重置 TTL，按 cache-read 计费。
+3. **判定**。解析响应 usage（`cache_read_input_tokens`，回退 `cached_tokens`）将探测分类为 hit 或 miss；响应其余部分丢弃。
 
-## 免责声明
+Headers 原样转发，仅去除 hop-by-hop 与长度头（由 `fetch` 自行管理）。
 
-- Kimi 缓存 TTL（~5 分钟）与价格是**观测行为，非 API 契约**；`saved` 统计为估算，不是退款承诺。
-- 仅支持 `kimi-coding` + `anthropic-messages` 路由。
-- 捕获内容只存内存；探测仅发往 `https://` 端点。
+## 护栏
+
+- 回合运行中跳过探测；`agent_settled` 重新 arm 定时器。
+- `maxIdle` 在长空闲期停止探测。
+- `miss` / `errors` 连续次数达到阈值，或 HTTP 401/403，暂停探测；下一次真实请求重新捕获凭据并自动解除暂停。
+- 会话探测花费按模型定价估算，达到上限即暂停。
+- 定时器 `unref()`，不阻止进程退出。
+
+## 成本
+
+Kimi K3 官方单价（$/1M tokens）：input 3，output 15，cache read 0.3，cache write 0。
+
+- 命中的探测约等于整个上下文的 cache-read 费用：50k tokens ≈ $0.015，100k ≈ $0.03，200k ≈ $0.06。
+- 未命中的探测按全价 input 重读同一前缀；连续 miss 达到阈值即暂停。
+- `saved` 统计 = `cacheReadTokens × (input − cacheRead) / 1M`，即等效冷恢复在全价下的开销的估算。
+
+Kimi 订阅按 quota 计费，USD 数值仅供参考。
+
+## 限制
+
+- ~5 分钟 TTL 与上述定价为观测行为，非 API 契约；`saved` 仅为估算。
+- 仅支持 `kimi-coding` + `anthropic-messages` 路由；其他 provider 缓存键语义不同，不在范围内。
+- 捕获内容仅存内存；探测仅发往 `https://` 端点。
 
 ## 开发
 
 ```bash
 npm install
 npm run typecheck
-npm test
+npm test          # 26 项测试；stub fetch、临时 $HOME、无网络
 ```
 
-测试基于 Node 原生 TypeScript 剥离（Node ≥ 22.18 / 24）运行，stub fetch + 临时 `$HOME`，无网络、无真实密钥。
+测试依赖 Node 原生 TypeScript 剥离（Node ≥ 22.18 / 24）。
 
 ## License
 

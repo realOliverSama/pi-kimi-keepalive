@@ -27,7 +27,7 @@
  * experiment with guardrails, not a savings promise.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -63,6 +63,12 @@ interface PersistedConfig {
   maxOutputTokens: number;
   /** Session probe-spend ceiling in USD; null disables the cap. */
   spendCapUsd: number | null;
+  /** Consecutive cache misses before probing pauses. */
+  maxMissStreak: number;
+  /** Consecutive failed probes (network/server errors) before probing pauses. */
+  maxErrorStreak: number;
+  /** True once the first-run setup wizard has completed (or been skipped). */
+  initialized: boolean;
 }
 
 const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
@@ -72,21 +78,25 @@ const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
   minPromptTokens: 512,
   maxOutputTokens: 16,
   spendCapUsd: 1.0,
+  maxMissStreak: 2,
+  maxErrorStreak: 3,
+  initialized: false,
 });
 
 const MIN_INTERVAL_MS = 30_000;
-const MISS_PAUSE_THRESHOLD = 2;
-const ERROR_STREAK_LIMIT = 3;
 const PROBE_TIMEOUT_MS = 30_000;
 
 const HELP_TEXT = [
   "pi-kimi-keepalive",
   "  /keepalive                show status",
+  "  /keepalive setup          interactive first-run wizard (maxidle, miss pause, error breaker, spend cap)",
   "  /keepalive on|off         enable / disable (persisted)",
   "  /keepalive now            one manual probe (bypasses pauses)",
   "  /keepalive resume         clear a sticky pause",
   "  /keepalive interval=4m    probe cadence (>= 30s)",
-  "  /keepalive maxidle=30m    stop probing after this idle time (0 = off)",
+  "  /keepalive maxidle=30m    stop probing after this idle time (0 = never stop)",
+  "  /keepalive miss=2         pause after N consecutive cache misses",
+  "  /keepalive errors=3       pause after N consecutive probe failures",
   "  /keepalive cap=1.0        session probe-spend ceiling in USD (0 = none)",
   "  /keepalive token=512      minimum cached prompt size for miss detection",
   "  /keepalive maxoutput=16   probe max_tokens clamp",
@@ -132,7 +142,9 @@ export default function (pi: ExtensionAPI) {
 
   // ---------- persistence ----------
 
-  function readConfigFromDisk(): void {
+  function readConfigFromDisk(): boolean {
+    // Returns whether a config file already existed on disk.
+    const existed = existsSync(STATE_FILE);
     try {
       const raw = JSON.parse(readFileSync(STATE_FILE, "utf8")) as Partial<PersistedConfig>;
       const int = (value: unknown, fallback: number, min = 1, cap = Number.MAX_SAFE_INTEGER): number =>
@@ -156,10 +168,14 @@ export default function (pi: ExtensionAPI) {
                 raw.spendCapUsd > 0
               ? raw.spendCapUsd
               : DEFAULT_CONFIG.spendCapUsd,
+        maxMissStreak: int(raw.maxMissStreak, DEFAULT_CONFIG.maxMissStreak, 1),
+        maxErrorStreak: int(raw.maxErrorStreak, DEFAULT_CONFIG.maxErrorStreak, 1),
+          initialized: raw.initialized === true,
       };
     } catch {
       config = { ...DEFAULT_CONFIG };
     }
+    return existed;
   }
 
   function persistConfig(): void {
@@ -171,7 +187,136 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // ---------- misc helpers ----------
+  // ---------- setup wizard ----------
+
+  async function runSetupWizard(wizardCtx: ExtensionContext, opts: { firstRun: boolean }): Promise<void> {
+    if (wizardCtx.hasUI !== true || typeof wizardCtx.ui?.input !== "function") {
+      // Headless / remote session: nothing to interact with, keep defaults.
+      notify(
+        "pi-kimi-keepalive setup needs an interactive UI. Defaults are in effect; " +
+          "configure later via /keepalive maxidle=30m miss=2 errors=3 cap=1.0.",
+        "info",
+      );
+      return;
+    }
+
+    const confirmNext = await wizardCtx.ui.confirm(
+      "pi-kimi-keepalive — first-time setup",
+      "Set the keepalive guardrails. Press Esc at any prompt to keep the default. " +
+        "All values are saved to ~/.pi/cache-keepalive/state.json and can be changed later " +
+        "via /keepalive <setting>.",
+    );
+    if (confirmNext !== true) {
+      config.initialized = true;
+      persistConfig();
+      notify(
+        "Setup skipped — defaults kept (interval 4m, maxidle 30m, miss 2, errors 3, cap $1.00). " +
+          "Run /keepalive setup to configure later, /keepalive on to enable.",
+        "info",
+      );
+      updateUi();
+      return;
+    }
+
+    // 1/4 — max idle cutoff
+    const maxIdleRaw = await wizardCtx.ui.input(
+      "Step 1/4 — Max idle cutoff (now " + formatDuration(config.maxIdleMs) + ")\n" +
+        "Stop probing once you have been idle longer than this, so a session left overnight " +
+        "does not keep spending quota. Examples: 30m, 1h, 2h — or 0 to never stop.\n" +
+        "Leave empty / press Esc to keep the default (30m).",
+      "30m",
+    );
+    if (maxIdleRaw !== undefined && maxIdleRaw.trim() !== "") {
+      const ms = parseDurationMs(maxIdleRaw);
+      if (ms === null) {
+        if (maxIdleRaw.trim() === "0") {
+          config.maxIdleMs = 0;
+        } else {
+          notify(`Invalid duration "${maxIdleRaw}" — keeping ${config.maxIdleMs === 0 ? "disabled" : formatDuration(config.maxIdleMs)}`, "error");
+        }
+      } else {
+        config.maxIdleMs = ms;
+      }
+    }
+
+    // 2/4 — miss pause threshold
+    const missRaw = await wizardCtx.ui.input(
+      "Step 2/4 — Miss pause threshold (now " + config.maxMissStreak + ")\n" +
+        "Pause probing after this many consecutive probes that did NOT hit the prompt cache " +
+        "(a cache hit resets the count). A high cache-read price with no hits means the " +
+        "provider's caching behaviour changed; pausing keeps you from burning quota blindly.",
+      String(config.maxMissStreak),
+    );
+    if (missRaw !== undefined && missRaw.trim() !== "") {
+      const n = Number(missRaw);
+      if (!Number.isInteger(n) || n < 1) {
+        notify(`Invalid miss threshold "${missRaw}" — keeping ${config.maxMissStreak}`, "error");
+      } else {
+        config.maxMissStreak = n;
+      }
+    }
+
+    // 3/4 — error circuit breaker
+    const errorRaw = await wizardCtx.ui.input(
+      "Step 3/4 — Error circuit breaker (default " + config.maxErrorStreak + ")\n" +
+        "Pause probing after this many consecutive failed probes (network errors, HTTP 5xx). " +
+        "Auth failures (HTTP 401/403) always pause immediately regardless of this value.",
+      String(config.maxErrorStreak),
+    );
+    if (errorRaw !== undefined && errorRaw.trim() !== "") {
+      const n = Number(errorRaw);
+      if (!Number.isInteger(n) || n < 1) {
+        notify(`Invalid error threshold — keeping ${config.maxErrorStreak}`, "error");
+      } else {
+        config.maxErrorStreak = n;
+      }
+    }
+
+    // 4/4 — spend cap
+    const spendRaw = await wizardCtx.ui.input(
+      "Step 4/4 — Session spend cap in USD (default " +
+        formatUsd(DEFAULT_CONFIG.spendCapUsd ?? 1.0) +
+        ")\n" +
+        "Ceiling on the estimated USD cost of probes in this session. A probe costs roughly " +
+        "the cache-read price of your whole context (about $0.03 per probe at 100k tokens). " +
+        "If you're on a Kimi subscription this is still a useful rough gauge. 0 disables the cap.",
+      "1.0",
+    );
+    if (spendRaw !== undefined && spendRaw.trim() !== "") {
+      const usd = parseUsd(spendRaw);
+      if (usd === null) {
+        notify("Invalid USD value — keeping the default cap", "error");
+      } else {
+        config.spendCapUsd = usd === 0 ? null : usd;
+      }
+    }
+
+    config.initialized = true;
+    persistConfig();
+
+    const enable = await wizardCtx.ui.confirm(
+      "Enable keepalive now?",
+      "Probing starts after your next real turn (it needs one captured request first). " +
+        "You can toggle anytime with /keepalive on / off.",
+    );
+    if (enable === true) {
+      config.enabled = true;
+      pausedReason = null;
+    }
+    persistConfig();
+    persistConfig();
+    notify(
+      "pi-kimi-keepalive configured:\n" +
+        `  maxidle:      ${config.maxIdleMs === 0 ? "never stop" : formatDuration(config.maxIdleMs)}\n` +
+        `  miss pause:   after ${config.maxMissStreak} consecutive cache misses\n` +
+        `  error breaker: ${config.maxErrorStreak} consecutive failures\n` +
+        `  spend cap:    ${config.spendCapUsd === null ? "none" : formatUsd(config.spendCapUsd)}\n` +
+        "  /keepalive status anytime — /keepalive on|off to toggle.",
+      "info",
+    );
+    updateUi();
+  }
+
 
   function isTargetModel(context: ExtensionContext | null): boolean {
     const model = context?.model;
@@ -325,7 +470,7 @@ export default function (pi: ExtensionAPI) {
       stats.misses += 1;
       missStreak += 1;
       debug(`probe miss #${missStreak}: cache_read=0 input=${usage.inputTokens}`);
-      if (missStreak >= MISS_PAUSE_THRESHOLD) {
+      if (missStreak >= config.maxMissStreak) {
         pause("probes stopped hitting the prefix cache; waiting for your next real turn");
       }
     }
@@ -349,7 +494,7 @@ export default function (pi: ExtensionAPI) {
       pause("captured credentials rejected; will recapture after your next real turn");
       return;
     }
-    if (errorStreak >= ERROR_STREAK_LIMIT) {
+    if (errorStreak >= config.maxErrorStreak) {
       pause(`${errorStreak} consecutive probe failures (last: ${message})`);
     }
   }
@@ -414,7 +559,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("keepalive", {
     description:
-      "Kimi prompt-cache keepalive: on|off|now|resume|status|reset|interval=4m|maxidle=30m|cap=1|token=512|maxoutput=16",
+      "Kimi prompt-cache keepalive: setup|on|off|now|resume|status|reset|interval=4m|maxidle=30m|miss=2|errors=3|cap=1|token=512|maxoutput=16",
     handler: async (args, commandCtx) => {
       ctx = commandCtx;
       const tokens = (args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -425,6 +570,9 @@ export default function (pi: ExtensionAPI) {
       for (const token of tokens) {
         const [key, value] = splitSetting(token);
         switch (key) {
+          case "setup":
+            await runSetupWizard(commandCtx, { firstRun: false });
+            break;
           case "on":
             config.enabled = true;
             pausedReason = null;
@@ -472,14 +620,41 @@ export default function (pi: ExtensionAPI) {
             break;
           }
           case "maxidle": {
+            if (value === "0") {
+              config.maxIdleMs = 0;
+              persistConfig();
+              notify("maxidle disabled — probing continues while idle", "info");
+              break;
+            }
             const ms = value !== undefined ? parseDurationMs(value) : null;
             if (ms === null) {
               notify("usage: /keepalive maxidle=30m (0 disables the cutoff)", "error");
               break;
             }
-            config.maxIdleMs = ms;
             persistConfig();
-            notify(ms === 0 ? "maxidle disabled" : `maxidle set to ${formatDuration(ms)}`, "info");
+            notify(ms === 0 ? "maxidle disabled — probing continues while idle" : `maxidle set to ${formatDuration(ms)}`, "info");
+            break;
+          }
+          case "miss": {
+            const n = value !== undefined ? Number(value) : NaN;
+            if (!Number.isInteger(n) || n < 1) {
+              notify("usage: /keepalive miss=2 (pause after N consecutive cache misses)", "error");
+              break;
+            }
+            config.maxMissStreak = n;
+            persistConfig();
+            notify(`miss pause threshold set to ${n} consecutive cache misses`, "info");
+            break;
+          }
+          case "errors": {
+            const n = value !== undefined ? Number(value) : NaN;
+            if (!Number.isInteger(n) || n < 1) {
+              notify("usage: /keepalive errors=3 (pause after N consecutive probe failures)", "error");
+              break;
+            }
+            config.maxErrorStreak = n;
+            persistConfig();
+            notify(`error circuit breaker set to ${n} consecutive failures`, "info");
             break;
           }
           case "cap": {
@@ -575,14 +750,27 @@ export default function (pi: ExtensionAPI) {
     updateUi();
   });
 
-  pi.on("session_start", async (_event, sessionCtx) => {
+  pi.on("session_start", async (event, sessionCtx) => {
     ctx = sessionCtx;
-    readConfigFromDisk();
+    const configExisted = readConfigFromDisk();
     // Captures are bound to the previous session's credentials; require a new capture.
     capture = null;
     capturedHeaders = {};
     lastSettledAt = Date.now();
     clearTimer();
+    if (
+      event.reason === "startup" &&
+      !configExisted &&
+      sessionCtx.hasUI === true &&
+      typeof sessionCtx.ui?.input === "function"
+    ) {
+      // Fresh install: walk the user through the guardrails once.
+      try {
+        await runSetupWizard(sessionCtx, { firstRun: true });
+      } catch (error) {
+        debug("setup wizard failed:", error instanceof Error ? error.message : error);
+      }
+    }
     updateUi();
   });
 

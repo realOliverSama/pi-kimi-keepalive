@@ -2,116 +2,116 @@
 
 Prompt-cache keepalive for [Kimi](https://www.kimi.com/) (`kimi-coding` provider) sessions in the [Pi coding agent](https://github.com/earendil-works/pi-coding-agent).
 
-While you think, eat, or sit in a meeting, Kimi's automatic prompt cache quietly expires (~5 minutes, observed, not contractual). Coming back means re-reading your *entire* conversation at full input price. This extension replays your last real provider request — conversation untouched — as a tiny background probe on an interval, so the cached prefix keeps its freshness and your session resumes at cache-read prices.
+Kimi's automatic prompt cache has an observed TTL of ~5 minutes. Once it expires, the next request re-reads the full context at full input price. This extension captures the last real provider request and replays it on a fixed interval while the session is idle, so the cached prefix stays warm and subsequent requests are billed at cache-read rates.
 
-**The probe never enters your session.** No synthetic user messages, no synthetic turns, no context pollution. Only aggregate statistics (hits / misses / estimated savings) are surfaced.
+Replayed requests are sent directly to the provider endpoint. They do not pass through the Pi session pipeline: no synthetic messages, no model turns, no changes to conversation history. Only aggregate statistics are surfaced.
 
 [中文文档](README.zh-CN.md)
 
-## Why replay instead of a synthetic message?
+## Requirements
 
-| Approach | Keeps cache warm | pollutes session | Notes |
-| --- | --- | --- | --- |
-| Manually send a tiny prompt every 5 min | ✅ | ✅ real messages | what you'd do by hand |
-| [pi-idle-time](https://github.com/clankercode/pi-idle-time) | ✅ | ✅ real turns | sends `[cache keepalive] {time}` user messages; the model replies; context grows forever |
-| [pi-warm-cache](https://github.com/ribbons-digital/pi-warm-cache) | ✅ | ❌ | fail-closed design: only works for routes registered as `anthropic-messages` **with** `cacheControlFormat === "anthropic"`; the `kimi-coding` route doesn't qualify, so it silently does nothing |
-| **pi-kimi-keepalive** | ✅ | ❌ | replays the captured payload byte-identical for the prefix; guardrails included |
-
-## How it works
-
-1. **Capture (read-only).** The `before_provider_headers` and `before_provider_request` hooks snapshot the headers and a `structuredClone` of the last real request to `kimi-coding` (`…/v1/messages`, Anthropic-compatible). Nothing is written to disk.
-2. **Replay.** While the agent is idle, the captured request is POSTed to `{baseUrl}/v1/messages` with only *terminal* parameters changed — `stream` removed, `thinking` removed, `max_tokens` clamped (default 16), and `tool_choice: {type:"none"}` added (dropped once, with a retry, if the endpoint rejects it). `system` / `messages` / `tools` — everything inside the provider's automatic prefix cache key — stay byte-identical, so the request lands in the same cached prefix and restarts its TTL at cache-read pricing.
-3. **Observe.** The response usage is parsed (Anthropic-style `cache_read_input_tokens`, OpenAI-style `cached_tokens` as fallback) to classify each probe as a hit or a miss. Nothing else is retained.
-
-Headers are forwarded verbatim except hop-by-hop/length headers (`content-length`, `host`, `connection`, …), which `fetch` manages itself.
-
-## Guardrails
-
-- **Busy-safe** — probes are skipped while the agent is working; `agent_settled` re-arms the timer.
-- **`maxIdle`** (default 30 min) — stops probing entirely after the configured idle runway. No burning quota overnight.
-- **Miss pause** — 2 consecutive probes that don't hit the prefix cache pause the loop until your next real turn.
-- **Error pause** — 3 consecutive failures, or any HTTP 401/403, pause probing until the next real request recaptures credentials.
-- **Spend cap** — session probe spending is estimated in USD and pauses at the ceiling (default $1.00; `cap=0` removes it).
-- **Timers are `unref`'d** — pending probes never keep the process alive.
-
-A single fresh real provider request automatically clears any sticky pause (it refreshes credentials and warms the cache by itself).
+- Node ≥ 20, pi ≥ 0.84 (exposes the `before_provider_headers` / `before_provider_request` hooks)
+- `kimi-coding` provider (OAuth or API key), `anthropic-messages` API
 
 ## Install
 
-```sh
-pi install npm:pi-kimi-keepalive
+```bash
+git clone https://github.com/realoliversama/pi-kimi-keepalive
+pi install /path/to/pi-kimi-keepalive
 ```
 
-Or run straight from a checkout:
+For a single session without installing:
 
 ```bash
-git clone https://github.com/oliverlyu/pi-kimi-keepalive
-pi -e ./pi-kimi-keepalive/src/index.ts
+pi -e /path/to/pi-kimi-keepalive/src/index.ts
 ```
 
-Requires Node ≥ 20 and a Pi build exposing the `before_provider_headers` / `before_provider_request` hooks (pi ≥ 0.84).
+After the package is published to npm: `pi install npm:pi-kimi-keepalive`.
 
-## Usage
+## Setup
+
+On the first start with no `~/.pi/cache-keepalive/state.json` present and an interactive UI, the extension runs a setup wizard that configures the four guardrails below. Leaving a prompt empty or pressing Esc keeps the default. The wizard can be rerun with `/keepalive setup`; in headless sessions it is skipped and defaults are kept.
+
+| Step | Setting | Command | Default | Description |
+| --- | --- | --- | --- | --- |
+| 1 | Max idle cutoff | `maxidle` | `30m` | Probing stops after this much idle time; `0` disables the cutoff. |
+| 2 | Miss pause threshold | `miss` | `2` | Pause after N consecutive probes that do not hit the prompt cache. A hit resets the count. |
+| 3 | Error circuit breaker | `errors` | `3` | Pause after N consecutive probe failures (network errors, HTTP 5xx). HTTP 401/403 always pauses immediately. |
+| 4 | Session spend cap | `cap` | `$1.00` | Ceiling on estimated USD probe spend per session; `0` removes the cap. |
+
+The wizard ends with a prompt to enable keepalive. Probing starts after the next real turn, which provides the captured request.
+
+## Commands
 
 ```
 /keepalive                  status
-/keepalive on|off           enable / disable (persisted in ~/.pi/cache-keepalive/state.json)
-/keepalive now              one manual probe
+/keepalive setup            rerun the setup wizard
+/keepalive on|off           enable / disable (persisted)
+/keepalive now              one manual probe (bypasses pauses)
 /keepalive resume           clear a sticky pause
 /keepalive interval=4m      probe cadence (≥ 30s)
-/keepalive maxidle=30m      probe cutoff after this idle time (0 = off)
+/keepalive maxidle=30m      idle cutoff (0 = disabled)
+/keepalive miss=2           pause after N consecutive cache misses
+/keepalive errors=3         pause after N consecutive probe failures
 /keepalive cap=1.0          session probe-spend ceiling in USD (0 = none)
-/keepalive token=512        minimum cached prompt size for miss detection
+/keepalive token=512        minimum prompt size for miss classification
 /keepalive maxoutput=16     probe max_tokens clamp
 /keepalive reset            zero the session stats
 ```
 
-Defaults (tuned against Kimi's observed ~5 min cache TTL):
+All settings persist to `~/.pi/cache-keepalive/state.json`. Statistics are per-session.
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `interval` | `4m` | probe cadence; 5 min TTL minus margin |
-| `maxidle` | `30m` | stop probing after this idle stretch (`0` = never) |
-| `token` | `512` | small responses below this input size can't be judged misses |
-| `maxoutput` | `16` | probe `max_tokens` clamp |
-| `cap` | `$1.00` | per-session probe spend ceiling (`0` = unlimited) |
+## How it works
 
-`on`/`interval`/`maxidle`/`cap`/… persist to `~/.pi/cache-keepalive/state.json`; hit/miss statistics are per-session. Set `PI_KEEPALIVE_DEBUG=1` for verbose stderr logging.
+1. **Capture.** The `before_provider_headers` and `before_provider_request` hooks snapshot the headers and a `structuredClone` of the payload of each real `kimi-coding` request. In-memory only; nothing is written to disk.
+2. **Replay.** While the agent is idle and enabled, the captured request is POSTed to `{baseUrl}/v1/messages` with only terminal parameters changed:
 
-## Cost model
+   | Change | Reason |
+   | --- | --- |
+   | remove `stream` | returns usage as a single JSON body |
+   | remove `thinking` | API requires `max_tokens > thinking.budget_tokens`, incompatible with the clamp below |
+   | `max_tokens: 16` | bounds the probe's output cost |
+   | `tool_choice: {type: "none"}` | prevents a tool-call round; dropped with a retry on HTTP 400 |
 
-Kimi 3 prices (per 1M tokens): input $3 · output $15 · **cache read $0.3**.
+   `system`, `messages`, and `tools` are kept byte-identical. These are the only inputs to the provider's prefix-cache key, so the replay matches the existing cache entry and restarts its TTL at cache-read pricing.
+3. **Classification.** Response usage (`cache_read_input_tokens`, falling back to `cached_tokens`) classifies each probe as a hit or a miss. The response is otherwise discarded.
 
-- A probe that **hits** pays ~cache-read price for your whole prefix: 50k tokens ≈ **$0.015**, 200k ≈ **$0.06**.
-- A probe that **misses** pays full input price for the same prefix — that's why misses pause the loop after 2 attempts.
-- The measured "savings" counter assumes a probe hit replaces a *cold* resume that would have re-read the prefix at full price; it is an estimate, useful for comparing against simply letting the cache die on sessions you will resume.
-- If you're on a Kimi subscription (kimi-coding OAuth), billing is quota-based and the USD figures are only a reference point.
+Headers are forwarded verbatim except hop-by-hop and length headers, which `fetch` manages.
 
-Ten probes an hour on a 100k-token session ≈ $0.30/h while idle — cheaper than one cold resume of that context, and it only runs while you're actually away. Tune `maxidle` and `cap` to taste.
+## Guardrails
 
-## Caveats
+- Probes are skipped while a turn is running; the timer rearms on `agent_settled`.
+- `maxIdle` cutoff stops probing during extended idle periods.
+- `miss` / `errors` streaks and HTTP 401/403 pause probing until the next real turn recaptures credentials and resets state.
+- Session probe spend is estimated from model pricing and pauses at the cap.
+- Timers are `unref()`'d and never keep the process alive.
+- All pauses are cleared automatically by the next real provider request.
 
-- Kimi's prompt-cache TTL (~5 min) and pricing are **observed behavior, not API contract**. This is a guardrailed experiment, not a savings promise — the `saved` figure is an estimate, not a refund.
-- Targets the `kimi-coding` provider with `anthropic-messages` API routes only. Other providers need different capture/probe logic and are out of scope.
-- The probe runs entirely inside your machine against `https://` endpoints only. Captured payloads/headers live only in process memory.
+## Cost accounting
+
+Kimi K3 list prices (USD per 1M tokens): input 3, output 15, cache read 0.3, cache write 0.
+
+- A probe that hits the prefix cache costs approximately the cache-read price of the full context: ~$0.015 at 50k tokens, ~$0.03 at 100k, ~$0.06 at 200k.
+- A probe that misses re-reads the prefix at full input price. Consecutive misses pause the loop (threshold: `miss`).
+- The `saved` counter estimates `cacheReadTokens × (input − cacheRead) / 1M` — what an equivalent cold resume would have cost at full input price.
+
+On a Kimi subscription, billing is quota-based and USD figures are indicative only.
+
+## Limitations
+
+- The ~5 minute TTL and the pricing above are observed behavior, not an API contract. The `saved` estimate is informational, not a guaranteed saving.
+- Only the `kimi-coding` provider with `anthropic-messages` API routes is supported. Other providers have different cache-key semantics and are out of scope.
+- Captured payloads and headers live only in process memory; probes are sent only to `https://` endpoints.
 
 ## Development
 
 ```bash
 npm install
 npm run typecheck
-npm test
+npm test          # 26 tests; stubbed fetch, temp $HOME, no network
 ```
 
-Tests run on Node's native TypeScript stripping (Node ≥ 22.18 / 24) with a stubbed `fetch` and a temp `$HOME` — no network, no real API keys.
-
-## FAQ
-
-**Why replay instead of sending a tiny synthetic "keepalive" message?** A synthetic message is still a real model turn: it bills as a new conversation prefix (cache *write* at best), and every message lands in your session history forever. Replaying the captured payload keeps the prefix byte-identical to the real session, so the provider's automatic prefix cache treats it as the same conversation; nothing enters your Pi session.
-
-**Why not support every provider?** Generic cache-keeping needs per-provider capture/probe logic (different cache-key semantics, OpenAI-style vs Anthropic-style). pi-warm-cache already covers registered anthropic-style routes; this extension intentionally scopes to what it can verify: `kimi-coding`.
-
-**Does a probe use my subscription quota?** Yes — like your manual 5-minute message, the probe itself is a real request billed by Kimi's rules (here at cache-read prices). Guardrails exist precisely to bound that spend.
+Tests run on Node's native TypeScript stripping (Node ≥ 22.18 / 24).
 
 ## License
 

@@ -92,7 +92,7 @@ function makePi() {
   };
 }
 
-function makeCtx({ idle = true, model } = {}) {
+function makeCtx({ idle = true, model, inputs = [], confirms = [] } = {}) {
   const ctx = {
     model: model ?? {
       id: "k3",
@@ -114,6 +114,18 @@ function makeCtx({ idle = true, model } = {}) {
         this.statuses.push({ key, value });
       },
       setWidget() {},
+      inputCalls: [],
+      // Queue of canned answers; shifts one per call. Empty queue ⇒ Esc/undefined.
+      input(title, placeholder) {
+        this.inputCalls.push({ title, placeholder });
+        return Promise.resolve(inputs.length > 0 ? inputs.shift() : undefined);
+      },
+      confirmCalls: [],
+      // Queue of canned answers; shifts one per call. Empty queue ⇒ cancel/false.
+      confirm(title, message) {
+        this.confirmCalls.push({ title, message });
+        return Promise.resolve(confirms.length > 0 ? confirms.shift() : false);
+      },
     },
   };
   return ctx;
@@ -478,4 +490,98 @@ test("interval below 30s is rejected and persisted settings survive restarts", a
   await pi.command("interval=5s", ctx);
   state = JSON.parse(readFileSync(statePath(), "utf8"));
   assert.equal(state.intervalMs, 90_000); // unchanged: below the 30s floor
+});
+// ---------------------------------------------------------------------------
+// setup wizard + guardrail settings
+// ---------------------------------------------------------------------------
+
+test("first-run wizard fires once on startup, collects guardrails, and can enable", async (t) => {
+  clearHomeState();
+  const pi = makePi();
+  const ctx = makeCtx({
+    inputs: ["45m", "3", "5", "0.5"],
+    confirms: [true, true], // intro confirm + enable confirm
+  });
+  factory(pi);
+
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+
+  // Four questions in order, each with an explanation in the title.
+  assert.equal(ctx.ui.inputCalls.length, 4);
+  assert.match(ctx.ui.inputCalls[0].title, /Max idle cutoff/);
+  assert.match(ctx.ui.inputCalls[1].title, /Miss pause threshold/);
+  assert.match(ctx.ui.inputCalls[2].title, /Error circuit breaker/);
+  assert.match(ctx.ui.inputCalls[3].title, /spend cap/i);
+  assert.ok(ctx.ui.confirmCalls.length >= 2);
+
+  const state = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(state.maxIdleMs, 45 * 60_000);
+  assert.equal(state.maxMissStreak, 3);
+  assert.equal(state.maxErrorStreak, 5);
+  assert.equal(state.spendCapUsd, 0.5);
+  assert.equal(state.enabled, true);
+  assert.equal(state.initialized, true);
+});
+
+test("cancelling the wizard keeps defaults and never re-asks on the next startup", async (t) => {
+  clearHomeState();
+  const pi = makePi();
+  const ctx = makeCtx({ confirms: [false] }); // decline the intro confirm
+  factory(pi);
+
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+  assert.equal(ctx.ui.inputCalls.length, 0); // no questions asked after declining
+
+  const saved = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.maxIdleMs, 30 * 60_000);
+  assert.equal(saved.maxMissStreak, 2);
+  assert.equal(saved.maxErrorStreak, 3);
+  assert.equal(saved.spendCapUsd, 1.0);
+  assert.equal(saved.initialized, true);
+
+  // A second startup with an existing config must not reopen the wizard.
+  await pi.emit("session_start", { reason: "startup" }, ctx);
+  assert.equal(ctx.ui.inputCalls.length, 0);
+});
+
+test("wizard answers persist via miss=/errors= commands and survive restart", async (t) => {
+  clearHomeState();
+  writeState({ enabled: false });
+  const pi = makePi();
+  const ctx = makeCtx();
+  factory(pi);
+  await pi.emit("session_start", {}, ctx);
+
+  await pi.command("miss=5", ctx);
+  await pi.command("errors=7", ctx);
+  let state = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(state.maxMissStreak, 5);
+  assert.equal(state.maxErrorStreak, 7);
+
+  await pi.command("miss=0", ctx);
+  await pi.command("errors=abc", ctx);
+  state = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(state.maxMissStreak, 5); // unchanged: invalid input rejected
+  assert.equal(state.maxErrorStreak, 7); // unchanged: invalid input rejected
+});
+
+test("configured error breaker raises the failure tolerance (was hardcoded 3)", async (t) => {
+  clearHomeState();
+  writeState({ enabled: true, intervalMs: 1100, maxIdleMs: 600_000, maxErrorStreak: 5, spendCapUsd: 0 });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  for (let i = 0; i < 5; i++) fetchStub.queue.push({ status: 500, body: { error: { message: "boom" } } });
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await settle(pi, ctx);
+  await sleep(6_500);
+
+  assert.equal(fetchStub.calls.length, 5); // 5 ticks needed before the configured breaker fires
+  assert.match(lastNotification(ctx), /paused/);
 });
