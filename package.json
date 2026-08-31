@@ -1,0 +1,42 @@
+{
+  "name": "pi-kimi-keepalive",
+  "version": "0.1.0",
+  "description": "Prompt-cache keepalive for Kimi (kimi-coding) sessions in the Pi coding agent. Replays the last real provider request while idle so the automatic prefix cache never expires.",
+  "type": "module",
+  "license": "MIT",
+  "author": "oliverlyu",
+  "homepage": "https://github.com/oliverlyu/pi-kimi-keepalive#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oliverlyu/pi-kimi-keepalive.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "kimi",
+    "moonshot",
+    "prompt-cache",
+    "cache",
+    "keepalive"
+  ],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/keepalive.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^24",
+    "typescript": "^5"
+  }
+}
