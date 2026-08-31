@@ -49,9 +49,9 @@ npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 /keepalive on|off           启用 / 停用（持久化）
 /keepalive now              手动探测一次（绕过暂停）
 /keepalive resume           清除 sticky 暂停
-/keepalive interval=4m      探测间隔（≥ 30s）
+/keepalive interval=4m45s   探测间隔（≥ 30s；应 ≤ 5m 以保持缓存命中）
 /keepalive maxidle=30m      空闲上限（0 = 不设限）
-/keepalive miss=2           连续 N 次缓存 miss 后暂停
+/keepalive miss=1           连续 N 次缓存 miss 后暂停
 /keepalive errors=3         连续 N 次探测失败后熔断
 /keepalive cap=1.0          会话探测花费上限（USD，0 = 无上限）
 /keepalive token=512        判定 miss 的最小 prompt token 数

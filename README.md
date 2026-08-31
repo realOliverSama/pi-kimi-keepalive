@@ -35,11 +35,13 @@ On the first start with no `~/.pi/cache-keepalive/state.json` present and an int
 | Step | Setting | Command | Default | Description |
 | --- | --- | --- | --- | --- |
 | 1 | Max idle cutoff | `maxidle` | `30m` | Probing stops after this much idle time; `0` disables the cutoff. |
-| 2 | Miss pause threshold | `miss` | `2` | Pause after N consecutive probes that do not hit the prompt cache. A hit resets the count. |
+| 2 | Miss pause threshold | `miss` | `1` | Pause after N consecutive probes that do not hit the prompt cache. A hit resets the count. |
 | 3 | Error circuit breaker | `errors` | `3` | Pause after N consecutive probe failures (network errors, HTTP 5xx). HTTP 401/403 always pauses immediately. |
 | 4 | Session spend cap | `cap` | `$1.00` | Ceiling on estimated USD probe spend per session; `0` removes the cap. |
 
 The wizard ends with a prompt to enable keepalive. Probing starts after the next real turn, which provides the captured request.
+
+Two operating points are worth knowing. The default cadence is **7 minutes** — deliberately past the ~5-minute cache TTL. A 7-minute probe never hits the cache: it runs once at full input price, confirms the cache has expired, and the default `miss=1` stops probing immediately, so the worst case is a single cold read per idle period. For an always-warm session instead, set a cadence inside the TTL (`/keepalive interval=4m45s`): every probe is then billed at cache-read rates (~1/10 of full price) and the loop keeps running until `maxidle` cuts it off.
 
 ## Commands
 
@@ -49,9 +51,9 @@ The wizard ends with a prompt to enable keepalive. Probing starts after the next
 /keepalive on|off           enable / disable (persisted)
 /keepalive now              one manual probe (bypasses pauses)
 /keepalive resume           clear a sticky pause
-/keepalive interval=4m      probe cadence (≥ 30s)
+/keepalive interval=4m45s   probe cadence (≥ 30s; ≤ 5m to stay inside the cache TTL)
 /keepalive maxidle=30m      idle cutoff (0 = disabled)
-/keepalive miss=2           pause after N consecutive cache misses
+/keepalive miss=1           pause after N consecutive cache misses
 /keepalive errors=3         pause after N consecutive probe failures
 /keepalive cap=1.0          session probe-spend ceiling in USD (0 = none)
 /keepalive token=512        minimum prompt size for miss classification

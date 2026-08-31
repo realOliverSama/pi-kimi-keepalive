@@ -4,11 +4,14 @@
   "description": "Prompt-cache keepalive for Kimi (kimi-coding) sessions in the Pi coding agent. Replays the last real provider request while idle so the automatic prefix cache never expires.",
   "type": "module",
   "license": "MIT",
-  "author": "oliverlyu",
-  "homepage": "https://github.com/oliverlyu/pi-kimi-keepalive#readme",
+  "author": "realOliverSama <159797106+realOliverSama@users.noreply.github.com>",
+  "homepage": "https://github.com/realoliversama/pi-kimi-keepalive#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/oliverlyu/pi-kimi-keepalive.git"
+    "url": "git+https://github.com/realoliversama/pi-kimi-keepalive.git"
+  },
+  "bugs": {
+    "url": "https://github.com/realoliversama/pi-kimi-keepalive/issues"
   },
   "keywords": [
     "pi-package",
@@ -25,6 +28,7 @@
   "files": [
     "src",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "scripts": {

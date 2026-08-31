@@ -74,12 +74,17 @@ interface PersistedConfig {
 
 const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
   enabled: false,
-  intervalMs: 4 * 60_000,
+  // 7 min: past the ~5 min cache TTL by design. A 7-min probe never hits the
+  // cache, so it acts as a single full-price confirmation that the cache is
+  // dead, and the default miss=1 stops probing right after — worst-case total
+  // spend is one cold read per session. Use /keepalive interval=4m45s for a
+  // hit-mode heartbeat (every probe is a cache read, ~10x cheaper).
+  intervalMs: 7 * 60_000,
   maxIdleMs: 30 * 60_000,
   minPromptTokens: 512,
   maxOutputTokens: 16,
   spendCapUsd: 1.0,
-  maxMissStreak: 2,
+  maxMissStreak: 1,
   maxErrorStreak: 3,
   initialized: false,
 });
@@ -94,9 +99,9 @@ const HELP_TEXT = [
   "  /keepalive on|off         enable / disable (persisted)",
   "  /keepalive now            one manual probe (bypasses pauses)",
   "  /keepalive resume         clear a sticky pause",
-  "  /keepalive interval=4m    probe cadence (>= 30s)",
+  "  /keepalive interval=4m45s probe cadence (>= 30s; <= 5m stays inside the cache TTL)",
   "  /keepalive maxidle=30m    stop probing after this idle time (0 = never stop)",
-  "  /keepalive miss=2         pause after N consecutive cache misses",
+  "  /keepalive miss=1         pause after N consecutive cache misses",
   "  /keepalive errors=3       pause after N consecutive probe failures",
   "  /keepalive cap=1.0        session probe-spend ceiling in USD (0 = none)",
   "  /keepalive token=512      minimum cached prompt size for miss detection",
@@ -196,7 +201,7 @@ export default function (pi: ExtensionAPI) {
       // Headless / remote session: nothing to interact with, keep defaults.
       notify(
         "pi-kimi-keepalive setup needs an interactive UI. Defaults are in effect; " +
-          "configure later via /keepalive maxidle=30m miss=2 errors=3 cap=1.0.",
+          "configure later via /keepalive maxidle=30m miss=1 errors=3 cap=1.0.",
         "info",
       );
       return;
@@ -212,7 +217,7 @@ export default function (pi: ExtensionAPI) {
       config.initialized = true;
       persistConfig();
       notify(
-        "Setup skipped — defaults kept (interval 4m, maxidle 30m, miss 2, errors 3, cap $1.00). " +
+        "Setup skipped — defaults kept (interval 7m, maxidle 30m, miss 1, errors 3, cap $1.00). " +
           "Run /keepalive setup to configure later, /keepalive on to enable.",
         "info",
       );

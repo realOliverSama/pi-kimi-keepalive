@@ -403,7 +403,7 @@ test("probes stop permanently once idle exceeds maxidle", async (t) => {
   assert.match(lastNotification(ctx), /maxidle/);
 });
 
-test("two consecutive cache misses pause probing until the next real turn", async (t) => {
+test("a cache miss pauses probing (default miss=1) until the next real turn", async (t) => {
   clearHomeState();
   writeState({ enabled: true, intervalMs: 1100, maxIdleMs: 600_000, spendCapUsd: 0, minPromptTokens: 512 });
   const pi = makePi();
@@ -413,21 +413,21 @@ test("two consecutive cache misses pause probing until the next real turn", asyn
     await shutdown(pi, ctx);
     fetchStub.restore();
   });
-  fetchStub.queue.push({ status: 200, body: MISS_USAGE }, { status: 200, body: MISS_USAGE });
+  fetchStub.queue.push({ status: 200, body: MISS_USAGE });
   factory(pi);
   await captureOnce(pi, ctx);
   await settle(pi, ctx);
   await sleep(2_700);
 
-  assert.equal(fetchStub.calls.length, 2); // third tick suppressed by the pause
+  assert.equal(fetchStub.calls.length, 1); // second tick suppressed by the pause
   assert.match(lastNotification(ctx), /paused/);
 
   // A fresh real request clears the sticky pause.
   await captureOnce(pi, ctx);
   await settle(pi, ctx);
-  fetchStub.queue.push({ status: 200, body: HIT_USAGE });
+  // cleared: the stub defaults to HIT usages, so the next tick probes and hits
   await sleep(1_500);
-  assert.equal(fetchStub.calls.length, 3);
+  assert.equal(fetchStub.calls.length, 2);
 });
 
 test("HTTP 400 triggers one retry without prompt_cache_retention", async (t) => {
@@ -573,7 +573,7 @@ test("cancelling the wizard keeps defaults and never re-asks on the next startup
   const saved = JSON.parse(readFileSync(statePath(), "utf8"));
   assert.equal(saved.enabled, false);
   assert.equal(saved.maxIdleMs, 30 * 60_000);
-  assert.equal(saved.maxMissStreak, 2);
+  assert.equal(saved.maxMissStreak, 1);
   assert.equal(saved.maxErrorStreak, 3);
   assert.equal(saved.spendCapUsd, 1.0);
   assert.equal(saved.initialized, true);
