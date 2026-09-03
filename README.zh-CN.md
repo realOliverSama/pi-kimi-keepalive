@@ -15,18 +15,32 @@ Kimi 的自动 prompt 缓存名义上在空闲 ~5 分钟后过期，但实测实
 
 ## 安装
 
-```bash
-git clone https://github.com/realoliversama/pi-kimi-keepalive
-pi install /path/to/pi-kimi-keepalive
-```
-
-单次会话试运行（不安装）：
+### 方案一：npm 安装（推荐；可收到更新）
 
 ```bash
-pi -e /path/to/pi-kimi-keepalive/src/index.ts
+pi install npm:pi-kimi-keepalive
 ```
 
-npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
+包已发布到 npm，新版本发布后可随时更新：
+
+```bash
+pi update npm:pi-kimi-keepalive
+```
+
+### 方案二：GitHub 安装（不用 npm 时；无更新渠道）
+
+```bash
+pi install git:github.com/realoliversama/pi-kimi-keepalive
+```
+
+该方式安装的是仓库默认分支在安装时刻的状态，**不会收到更新**——想升级需重新执行同一安装命令（或先 `pi remove git:github.com/realoliversama/pi-kimi-keepalive`）。
+
+### 单次会话试运行（不安装）
+
+```bash
+pi -e npm:pi-kimi-keepalive                                    # 从 npm
+pi -e git:github.com/realoliversama/pi-kimi-keepalive          # 从 GitHub
+```
 
 ## 初始化
 

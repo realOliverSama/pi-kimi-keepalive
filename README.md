@@ -15,18 +15,32 @@ Replayed requests are sent directly to the provider endpoint. They do not pass t
 
 ## Install
 
-```bash
-git clone https://github.com/realoliversama/pi-kimi-keepalive
-pi install /path/to/pi-kimi-keepalive
-```
-
-For a single session without installing:
+### Option 1 — npm (recommended; receives updates)
 
 ```bash
-pi -e /path/to/pi-kimi-keepalive/src/index.ts
+pi install npm:pi-kimi-keepalive
 ```
 
-After the package is published to npm: `pi install npm:pi-kimi-keepalive`.
+The package is published on npm and picks up new releases with:
+
+```bash
+pi update npm:pi-kimi-keepalive
+```
+
+### Option 2 — GitHub (if you don't use npm; no update channel)
+
+```bash
+pi install git:github.com/realoliversama/pi-kimi-keepalive
+```
+
+This installs whatever is on the repository's default branch at install time. It does **not** receive updates — to move to a newer version, re-run the same install command (or `pi remove git:github.com/realoliversama/pi-kimi-keepalive` first).
+
+### Single session without installing
+
+```bash
+pi -e npm:pi-kimi-keepalive        # from npm
+pi -e git:github.com/realoliversama/pi-kimi-keepalive   # from GitHub
+```
 
 ## Setup
 
