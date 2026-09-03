@@ -2,7 +2,7 @@
 
 Prompt-cache keepalive for [Kimi](https://www.kimi.com/) (`kimi-coding` provider) sessions in the [Pi coding agent](https://github.com/earendil-works/pi-coding-agent).
 
-Kimi's automatic prompt cache has an observed TTL of ~5 minutes. Once it expires, the next request re-reads the full context at full input price. This extension captures the last real provider request and replays it on a fixed interval while the session is idle, so the cached prefix stays warm and subsequent requests are billed at cache-read rates.
+Kimi's automatic prompt cache nominally expires after ~5 minutes of idle, but real-world testing shows the live TTL runs longer — probes as far apart as 8 minutes still hit reliably. Once the cache does expire, the next request re-reads the full context at full input price. This extension captures the last real provider request and replays it on a fixed interval while the session is idle, so the cached prefix stays warm and subsequent requests are billed at cache-read rates.
 
 Replayed requests are sent directly to the provider endpoint. They do not pass through the Pi session pipeline: no synthetic messages, no model turns, no changes to conversation history. Only aggregate statistics are surfaced.
 
@@ -46,7 +46,7 @@ The wizard ends with a prompt to enable keepalive. Probing starts after the next
 
 Two modes share the same guardrails; they differ in how the cadence is chosen.
 
-**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **8 minutes** by default — deliberately past the ~5-minute nominal cache TTL. An 8-minute probe rarely hits the cache: it runs once at full input price, confirms the cache has expired, and the default `miss=1` stops probing immediately, so the worst case is a single cold read per idle period. For an always-warm session instead, set a cadence inside the observed TTL (`/keepalive interval=4m45s`…`7m`): every probe is then billed at cache-read rates (~1/10 of full price) and the loop keeps running until `maxidle` cuts it off.
+**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **8 minutes** by default. Real-world testing shows probes at this cadence reliably hit the prefix cache (the effective TTL runs longer than the ~5-minute nominal one), so the default cadence already works as the always-warm heartbeat: every probe renews the cache at cache-read rates (~1/10 of full input price) until `maxidle` cuts the loop off. If the cache does expire underneath it (server-side eviction, TTL change), the probe misses once at full price and the default `miss=1` stops probing immediately — the worst case is a single cold read per idle period, after which the next real turn re-arms. Prefer a tighter guarantee? Set a shorter cadence (`/keepalive interval=4m45s`…`7m`).
 
 **`smart` (`/keepalive mode=smart`)** — self-tunes the cadence toward the real cache TTL instead of guessing it:
 
@@ -68,7 +68,7 @@ Per learn cycle the spend is minimal: 5 cache-read probes confirm a step, and on
 /keepalive resume           clear a sticky pause
 /keepalive mode=smart       adaptive cadence (8m floor; +30s per 5-hit confirmation; a miss parks probing, mode=smart resumes)
 /keepalive mode=default     fixed cadence (the interval= value)
-/keepalive interval=4m45s   probe cadence in default mode (≥ 30s; ≤ 5m to stay inside the cache TTL)
+/keepalive interval=4m45s   probe cadence in default mode (≥ 30s; default 8m reliably hits the cache in practice)
 /keepalive maxidle=30m      idle cutoff (0 = disabled)
 /keepalive miss=1           pause after N consecutive cache misses
 /keepalive errors=3         pause after N consecutive probe failures
@@ -120,7 +120,7 @@ On a Kimi subscription, billing is quota-based and USD figures are indicative on
 
 ## Limitations
 
-- The ~5 minute TTL and the pricing above are observed behavior, not an API contract. The `saved` estimate is informational, not a guaranteed saving.
+- The nominal ~5-minute TTL, the longer effective TTL observed in practice, and the pricing above are observed behavior, not an API contract. The `saved` estimate is informational, not a guaranteed saving.
 - Only the `kimi-coding` provider (`kimi-openai-completions` API, with an `anthropic-messages` fallback) is supported. Other providers have different cache-key semantics and are out of scope.
 - Captured payloads and headers live only in process memory; probes are sent only to `https://` endpoints.
 

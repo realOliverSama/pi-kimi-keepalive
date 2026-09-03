@@ -4,7 +4,7 @@ English | [中文文档](README.zh-CN.md)
 
 Prompt-cache keepalive for [Kimi](https://www.kimi.com/) (`kimi-coding` provider) sessions in the [Pi coding agent](https://github.com/earendil-works/pi-coding-agent).
 
-Kimi 的自动 prompt 缓存 TTL 实测约 5 分钟。TTL 过期后恢复会话时，整个上下文以全价 input（$3 / 1M）重新计算。本扩展捕获最后一条真实 provider 请求，在会话空闲期间以固定间隔将其重放至同一端点，使缓存前缀在 TTL 内保持有效，后续请求按 cache-read 价格（$0.3 / 1M）计费。
+Kimi 的自动 prompt 缓存名义上在空闲 ~5 分钟后过期，但实测实际 TTL 更长——间隔 8 分钟的探测仍基本稳定命中。缓存真正过期后，整个上下文以全价 input（$3 / 1M）重新计算。本扩展捕获最后一条真实 provider 请求，在会话空闲期间以固定间隔将其重放至同一端点，使缓存前缀在 TTL 内保持有效，后续请求按 cache-read 价格（$0.3 / 1M）计费。
 
 重放请求直接发送到 provider 端点，不经过 Pi 会话管道：不产生合成消息、不产生模型回合、不改动对话历史，仅在界面上展示聚合统计。
 
@@ -46,7 +46,7 @@ npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 
 两种模式共用一套护栏，区别仅在间隔的确定方式。
 
-**`default`（默认模式）**——间隔固定为 `interval=` 所设值，默认 **8 分钟**——刻意超过 ~5 分钟的名义缓存 TTL。8 分钟的探测通常无法命中：以全价输入运行一次、确认缓存已过期，默认 `miss=1` 随即停止探测，因此最坏情况是每个空闲期仅一次全价冷读。若想保持会话常热，可把间隔设在实测 TTL 之内（`/keepalive interval=4m45s`…`7m`）：每次探测按缓存读价计费（约为全价的 1/10），循环持续到 `maxidle` 截断。
+**`default`（默认模式）**——间隔固定为 `interval=` 所设值，默认 **8 分钟**。实测该间隔的探测基本稳定命中前缀缓存（实际 TTL 长于名义的 ~5 分钟），因此默认间隔本身就是常热心跳：每次探测以缓存读价（约为全价 input 的 1/10）续期缓存，循环持续到 `maxidle` 截断。若缓存确实在下方过期（服务端逐出、TTL 变更），探测以全价 miss 一次，默认 `miss=1` 随即停止——最坏情况是每个空闲期仅一次全价冷读，下次真实轮次后自动重新启动。想更保守可设更短间隔（`/keepalive interval=4m45s`…`7m`）。
 
 **`smart`（`/keepalive mode=smart`）**——不猜测 TTL，而是自适应逼近真实值：
 
@@ -68,7 +68,7 @@ npm 发布后可使用 `pi install npm:pi-kimi-keepalive`。
 /keepalive resume           清除 sticky 暂停
 /keepalive mode=smart       自适应间隔（下限 8m；每 5 连中 +30s；一次 miss 即停靠，mode=smart 恢复探测）
 /keepalive mode=default     固定间隔（即 interval= 的值）
-/keepalive interval=4m45s   default 模式下的探测间隔（≥ 30s；应 ≤ 5m 以保持缓存命中）
+/keepalive interval=4m45s   default 模式下的探测间隔（≥ 30s；默认 8m 实测基本稳定命中）
 /keepalive maxidle=30m      空闲上限（0 = 不设限）
 /keepalive miss=1           连续 N 次缓存 miss 后暂停
 /keepalive errors=3         连续 N 次探测失败后熔断
@@ -118,7 +118,7 @@ Kimi 订阅按 quota 计费，USD 数值仅供参考。
 
 ## 限制
 
-- ~5 分钟 TTL 与上述定价为观测行为，非 API 契约；`saved` 仅为估算。
+- 名义 ~5 分钟 TTL、实测更长的有效 TTL 与上述定价均为观测行为，非 API 契约；`saved` 仅为估算。
 - 仅支持 `kimi-coding`（`kimi-openai-completions` API，含 `anthropic-messages` 回退）；其他 provider 缓存键语义不同，不在范围内。
 - 捕获内容仅存内存；探测仅发往 `https://` 端点。
 

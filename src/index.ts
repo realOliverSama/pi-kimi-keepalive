@@ -76,11 +76,12 @@ interface PersistedConfig {
 
 const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
   enabled: false,
-  // 7 min: past the ~5 min cache TTL by design. A 7-min probe never hits the
-  // cache, so it acts as a single full-price confirmation that the cache is
-  // dead, and the default miss=1 stops probing right after — worst-case total
-  // spend is one cold read per session. Use /keepalive interval=4m45s for a
-  // hit-mode heartbeat (every probe is a cache read, ~10x cheaper).
+  // 8 min: real-world testing shows probes at this cadence still hit the
+  // prefix cache reliably (the effective TTL runs longer than the ~5 min
+  // nominal TTL), so the default cadence IS the hit-mode heartbeat — every
+  // probe is billed at cache-read rates (~10x cheaper than a cold read).
+  // If the cache does expire (e.g. server-side eviction), the probe misses
+  // once at full price and the default miss=1 stops probing immediately.
   intervalMs: 8 * 60_000,
   maxIdleMs: 30 * 60_000,
   minPromptTokens: 512,
@@ -110,7 +111,7 @@ const HELP_TEXT = [
   "  /keepalive resume         clear a sticky pause",
   "  /keepalive mode=smart     adaptive cadence (8m floor; +30s per 5-hit confirmation; a miss pauses probing, mode=smart resumes)",
   "  /keepalive mode=default   fixed cadence (the interval= value)",
-  "  /keepalive interval=4m45s probe cadence (default mode; >= 30s; <= 5m stays inside the cache TTL)",
+  "  /keepalive interval=4m45s probe cadence (default mode; >= 30s; default 8m reliably hits the cache in practice)",
   "  /keepalive maxidle=30m    stop probing after this idle time (0 = never stop)",
   "  /keepalive miss=1         pause after N consecutive cache misses",
   "  /keepalive errors=3       pause after N consecutive probe failures",
