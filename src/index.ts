@@ -95,9 +95,16 @@ const DEFAULT_CONFIG: Readonly<PersistedConfig> = Object.freeze({
 
 // smart-mode constants
 const SMART_BASE_MS = 8 * 60_000; // smart starting/floor cadence (matches the default interval)
-const SMART_STEP_MS = 30_000; // +30s per 5-hit confirmation
-const SMART_CONFIRM_HITS = 5;
+const SMART_STEP_MS = 30_000; // +30s per 3-hit confirmation
+const SMART_CONFIRM_HITS = 3;
 const SMART_MAX_CONTEXT_TOKENS = 200_000; // context cap: grow only below this
+/**
+ * default-mode safe floor: the nominal cache TTL. A miss while probing above
+ * this cadence drops the cadence here and keeps probing (the miss probe
+ * itself rebuilds the cache entry, so the next ≤5m probe renews it); only a
+ * miss AT this floor counts toward the miss-pause threshold.
+ */
+const DEFAULT_FALLBACK_MS = 5 * 60_000;
 
 const MIN_INTERVAL_MS = 30_000;
 const PROBE_TIMEOUT_MS = 30_000;
@@ -109,7 +116,7 @@ const HELP_TEXT = [
   "  /keepalive on|off         enable / disable (persisted)",
   "  /keepalive now            one manual probe (bypasses pauses)",
   "  /keepalive resume         clear a sticky pause",
-  "  /keepalive mode=smart     adaptive cadence (8m floor; +30s per 5-hit confirmation; a miss pauses probing, mode=smart resumes)",
+  "  /keepalive mode=smart     adaptive cadence (8m floor; +30s per 3-hit confirmation; a miss parks probing, mode=smart resumes)",
   "  /keepalive mode=default   fixed cadence (the interval= value)",
   "  /keepalive interval=4m45s probe cadence (default mode; >= 30s; default 8m reliably hits the cache in practice)",
   "  /keepalive maxidle=30m    stop probing after this idle time (0 = never stop)",
@@ -320,7 +327,7 @@ export default function (pi: ExtensionAPI) {
     const modeRaw = await wizardCtx.ui.input(
       "Step 5/5 — Probing mode (now " + config.mode + ")\n" +
         "default: probes run at the fixed interval above.\n" +
-        "smart: starts at 8m; after 5 consecutive hits (context ≤ 200k) the cadence grows by 30s; " +
+        "smart: starts at 8m; after 3 consecutive hits (context ≤ 200k) the cadence grows by 30s; " +
         "one miss steps back to the last confirmed value and parks probing until you re-select smart mode — " +
         "it self-tunes toward the real cache TTL to minimize probe spend.\n" +
         "Type smart to enable; leave empty / press Esc for default.",
@@ -565,6 +572,20 @@ export default function (pi: ExtensionAPI) {
       debug(`probe miss: cache_read=0 input=${usage.inputTokens}`);
       if (config.mode === "smart") {
         smartAdaptAfterMiss();
+      } else if (config.intervalMs > DEFAULT_FALLBACK_MS) {
+        // Miss while probing above the safe floor: the miss probe itself
+        // rebuilds the cache entry with the same prefix, so drop to the 5m
+        // safe cadence (inside the nominal TTL) and keep probing — the next
+        // probe renews it. Reset the streak so the new cadence gets a fresh
+        // chance before a pause is considered.
+        config.intervalMs = DEFAULT_FALLBACK_MS;
+        missStreak = 0;
+        persistConfig();
+        notify(
+          `cache miss — cadence backed off to ${formatDuration(config.intervalMs)} (safe TTL window); probing continues`,
+          "info",
+        );
+        updateUi();
       } else {
         missStreak += 1;
         debug(`probe miss #${missStreak}: cache_read=0 input=${usage.inputTokens}`);
@@ -618,7 +639,7 @@ export default function (pi: ExtensionAPI) {
     const roomUnderMaxIdle =
       config.maxIdleMs === 0 || config.intervalMs + SMART_STEP_MS < config.maxIdleMs;
     if (roomUnderMaxIdle) {
-      config.intervalMs += SMART_STEP_MS; // 5-hit-confirmed value stays on disk
+      config.intervalMs += SMART_STEP_MS; // 3-hit-confirmed value stays on disk
       persistConfig();
       debug(
         `smart: ${smartHitStreak} consecutive hits — cadence grows to ${formatDuration(config.intervalMs)}`,

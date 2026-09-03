@@ -654,13 +654,13 @@ test("mode=smart persists and 5 consecutive hits grow the cadence by 30s", async
   await captureOnce(pi, ctx);
   await pi.command("on", ctx);
 
-  // Five floor hits confirm the 8m cadence and promote it to 8m30s.
-  for (let i = 0; i < 5; i++) {
+  // Three floor hits confirm the 8m cadence and promote it to 8m30s.
+  for (let i = 0; i < 3; i++) {
     await pi.command("now", ctx);
     await settle(pi, ctx);
     await sleep(20);
   }
-  assert.equal(fetchStub.calls.length, 5);
+  assert.equal(fetchStub.calls.length, 3);
   const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
   assert.equal(persisted.mode, "smart");
   assert.equal(persisted.intervalMs, 8 * 60_000 + 30_000);
@@ -795,4 +795,43 @@ test("interval= is rejected while smart mode manages the cadence", async (t) => 
   const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
   assert.equal(persisted.intervalMs, 8 * 60_000);
   assert.match(lastNotification(ctx), /smart mode manages the cadence/);
+});
+
+test("default mode backs off to the 5m safe cadence on a miss and keeps probing", async (t) => {
+  clearHomeState();
+  writeState({ enabled: false, intervalMs: 8 * 60_000, maxIdleMs: 0, spendCapUsd: 0, minPromptTokens: 512 });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  // first probe (8m) misses, next probes (5m cadence) hit again
+  fetchStub.queue.push({ status: 200, body: MISS_USAGE });
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await pi.command("on", ctx);
+
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  await sleep(30);
+  assert.equal(fetchStub.calls.length, 1);
+  assert.ok(ctx.ui.notifications.some((n) => /backed off to 5m/.test(n.text)));
+  assert.ok(!ctx.ui.notifications.some((n) => /paused/.test(n.text)));
+  let persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.intervalMs, 5 * 60_000);
+
+  // the follow-up probe at 5m hits, so probing keeps running (no pause)
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  await sleep(30);
+  assert.equal(fetchStub.calls.length, 2);
+  assert.ok(!lastNotification(ctx).match(/paused/));
+
+  // a miss AT the 5m floor counts toward the miss-pause threshold (miss=1)
+  fetchStub.queue.push({ status: 200, body: MISS_USAGE });
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  assert.match(lastNotification(ctx), /paused/);
 });

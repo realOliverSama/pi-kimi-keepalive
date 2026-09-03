@@ -46,17 +46,19 @@ The wizard ends with a prompt to enable keepalive. Probing starts after the next
 
 Two modes share the same guardrails; they differ in how the cadence is chosen.
 
-**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **8 minutes** by default. Real-world testing shows probes at this cadence reliably hit the prefix cache (the effective TTL runs longer than the ~5-minute nominal one), so the default cadence already works as the always-warm heartbeat: every probe renews the cache at cache-read rates (~1/10 of full input price) until `maxidle` cuts the loop off. If the cache does expire underneath it (server-side eviction, TTL change), the probe misses once at full price and the default `miss=1` stops probing immediately — the worst case is a single cold read per idle period, after which the next real turn re-arms. Prefer a tighter guarantee? Set a shorter cadence (`/keepalive interval=4m45s`…`7m`).
+**`default` (the starting mode)** — the cadence is fixed at whatever `interval=` says, **8 minutes** by default. Real-world testing shows probes at this cadence reliably hit the prefix cache (the effective TTL runs longer than the ~5-minute nominal one), so the default cadence already works as the always-warm heartbeat: every probe renews the cache at cache-read rates (~1/10 of full input price) until `maxidle` cuts the loop off.
+
+If the cache does expire underneath it (server-side eviction, TTL change), the mode self-heals instead of giving up: the missed probe itself rebuilds the cache entry with the same prefix, so the cadence drops to the **5-minute safe floor** (inside the nominal TTL), probing continues, and the next probe renews the entry. Only a miss **at** the 5-minute floor counts toward the `miss` pause threshold — a cache that cannot even be rebuilt at 5m is an environment problem, and the default `miss=1` stops probing there. The back-off is persisted; `/keepalive interval=8m` returns to the original cadence.
 
 **`smart` (`/keepalive mode=smart`)** — self-tunes the cadence toward the real cache TTL instead of guessing it:
 
 1. Starts at **8 minutes**.
-2. After **5 consecutive hits** the cadence is confirmed and the value grows by **+30s**. Only confirmed values are persisted, so `~/.pi/cache-keepalive/state.json` always holds the largest cadence with observed consecutive hits.
+2. After **3 consecutive hits** the cadence is confirmed and the value grows by **+30s**. Only confirmed values are persisted, so `~/.pi/cache-keepalive/state.json` always holds the largest cadence with observed consecutive hits.
 3. A **miss** immediately parks probing: the cadence steps back **30s** to the last confirmed value (never below the 8m floor), the value is persisted, and probing stays **stopped**. A fresh real turn does **not** resume it — only re-selecting smart mode (`/keepalive mode=smart`) continues from the parked cadence.
 4. **Context guard:** growth only happens while the last probe saw ≤ **200k prompt tokens**; the first probe above that immediately reverts the cadence to the 8m floor and keeps it there (a missed probe on a 200k+ context is too expensive to risk).
 5. Guardrails (`maxidle`, `cap`, `errors`, HTTP 401/403) still apply while smart is probing.
 
-Per learn cycle the spend is minimal: 5 cache-read probes confirm a step, and one full-price probe ends the cycle — the parked cadence keeps every future session at the highest value the cache has proven to hold.
+Per learn cycle the spend is minimal: 3 cache-read probes confirm a step, and one full-price probe ends the cycle — the parked cadence keeps every future session at the highest value the cache has proven to hold.
 
 ## Commands
 
@@ -66,7 +68,7 @@ Per learn cycle the spend is minimal: 5 cache-read probes confirm a step, and on
 /keepalive on|off           enable / disable (persisted)
 /keepalive now              one manual probe (bypasses pauses)
 /keepalive resume           clear a sticky pause
-/keepalive mode=smart       adaptive cadence (8m floor; +30s per 5-hit confirmation; a miss parks probing, mode=smart resumes)
+/keepalive mode=smart       adaptive cadence (8m floor; +30s per 3-hit confirmation; a miss parks probing, mode=smart resumes)
 /keepalive mode=default     fixed cadence (the interval= value)
 /keepalive interval=4m45s   probe cadence in default mode (≥ 30s; default 8m reliably hits the cache in practice)
 /keepalive maxidle=30m      idle cutoff (0 = disabled)
