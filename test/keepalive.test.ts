@@ -835,3 +835,28 @@ test("default mode backs off to the 5m safe cadence on a miss and keeps probing"
   await settle(pi, ctx);
   assert.match(lastNotification(ctx), /paused/);
 });
+
+test("/keepalive maxidle=1h actually sets and persists the cutoff", async (t) => {
+  clearHomeState();
+  writeState({ enabled: false, intervalMs: 60_000, maxIdleMs: 600_000, spendCapUsd: 0, minPromptTokens: 512 });
+  const pi = makePi();
+  const ctx = makeCtx();
+  factory(pi);
+  await captureOnce(pi, ctx);
+
+  await pi.command("maxidle=1h", ctx);
+  const persisted = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(persisted.maxIdleMs, 3_600_000);
+  assert.match(lastNotification(ctx), /maxidle set to 1h0m/);
+
+  // only the bare "0" disables the cutoff; "0m" is rejected as invalid
+  await pi.command("maxidle=0m", ctx);
+  const unchanged = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(unchanged.maxIdleMs, 3_600_000);
+  assert.match(lastNotification(ctx), /usage:/);
+
+  await pi.command("maxidle=0", ctx);
+  const disabled = JSON.parse(readFileSync(statePath(), "utf8"));
+  assert.equal(disabled.maxIdleMs, 0);
+  assert.match(lastNotification(ctx), /maxidle disabled/);
+});

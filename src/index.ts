@@ -202,7 +202,7 @@ export default function (pi: ExtensionAPI) {
         maxMissStreak: int(raw.maxMissStreak, DEFAULT_CONFIG.maxMissStreak, 1),
         maxErrorStreak: int(raw.maxErrorStreak, DEFAULT_CONFIG.maxErrorStreak, 1),
         mode: raw.mode === "smart" ? "smart" : "default",
-          initialized: raw.initialized === true,
+        initialized: raw.initialized === true,
       };
     } catch {
       config = { ...DEFAULT_CONFIG };
@@ -233,8 +233,10 @@ export default function (pi: ExtensionAPI) {
     }
 
     const confirmNext = await wizardCtx.ui.confirm(
-      "pi-kimi-keepalive — first-time setup",
-      "Set the keepalive guardrails. Press Esc at any prompt to keep the default. " +
+      opts.firstRun
+        ? "pi-kimi-keepalive — first-time setup"
+        : "pi-kimi-keepalive — reconfigure",
+      "Set the keepalive guardrails. Press Esc at any prompt to keep the current value. " +
         "All values are saved to ~/.pi/cache-keepalive/state.json and can be changed later " +
         "via /keepalive <setting>.",
     );
@@ -670,6 +672,11 @@ export default function (pi: ExtensionAPI) {
     errorStreak += 1;
     debug("probe failed:", message);
     if (/^HTTP 40[13]\b/.test(message)) {
+      // Credentials are dead regardless of history; clear the streaks so the
+      // automatic recovery after the next real turn starts from a clean slate.
+      missStreak = 0;
+      errorStreak = 0;
+      smartHitStreak = 0;
       pause("captured credentials rejected; will recapture after your next real turn");
       return;
     }
@@ -843,6 +850,7 @@ export default function (pi: ExtensionAPI) {
               notify("usage: /keepalive maxidle=30m (0 disables the cutoff)", "error");
               break;
             }
+            config.maxIdleMs = ms;
             persistConfig();
             notify(ms === 0 ? "maxidle disabled — probing continues while idle" : `maxidle set to ${formatDuration(ms)}`, "info");
             break;
