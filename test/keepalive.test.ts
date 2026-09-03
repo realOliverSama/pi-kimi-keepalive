@@ -14,6 +14,8 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.HOME = mkdtempSync(join(tmpdir(), "pi-keepalive-test-"));
+// Redirect auth.json too (probeHeaders reads the live token from there).
+process.env.PI_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-keepalive-test-agent-"));
 
 const { default: factory } = await import("../src/index.ts");
 import * as lib from "../src/lib.ts";
@@ -834,6 +836,32 @@ test("default mode backs off to the 5m safe cadence on a miss and keeps probing"
   await pi.command("now", ctx);
   await settle(pi, ctx);
   assert.match(lastNotification(ctx), /paused/);
+});
+
+test("probe prefers the live auth.json token over captured request headers", async (t) => {
+  clearHomeState();
+  writeState({ enabled: false, intervalMs: 60_000, maxIdleMs: 0, spendCapUsd: 0, minPromptTokens: 512 });
+  mkdirSync(process.env.PI_AGENT_DIR as string, { recursive: true });
+  writeFileSync(
+    join(process.env.PI_AGENT_DIR as string, "auth.json"),
+    JSON.stringify({ "kimi-coding": { access: "fresh-token" } }),
+  );
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+    rmSync(join(process.env.PI_AGENT_DIR as string, "auth.json"), { force: true });
+  });
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await pi.command("on", ctx);
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+
+  assert.equal(fetchStub.calls.length, 1);
+  assert.equal(fetchStub.calls[0].init.headers.authorization, "Bearer fresh-token");
 });
 
 test("/keepalive maxidle=1h actually sets and persists the cutoff", async (t) => {

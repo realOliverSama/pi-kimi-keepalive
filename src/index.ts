@@ -51,7 +51,10 @@ import {
 
 const STATE_DIR = join(homedir(), ".pi", "cache-keepalive");
 const STATE_FILE = join(STATE_DIR, "state.json");
-const AUTH_FILE = join(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "auth.json");
+/** Live OAuth state; resolved lazily so tests can redirect it via PI_AGENT_DIR. */
+function authFile(): string {
+  return join(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "auth.json");
+}
 
 interface PersistedConfig {
   enabled: boolean;
@@ -473,22 +476,26 @@ export default function (pi: ExtensionAPI) {
    */
   function probeHeaders(): Record<string, string> | null {
     if (!capture) return null;
-    const headers = buildProbeHeaders(capture.headers);
-    if (!headers.authorization) {
-      try {
-        const raw = JSON.parse(readFileSync(AUTH_FILE, "utf8")) as Record<string, unknown>;
-        const entry = (raw["kimi-coding"] ?? null) as { access?: unknown } | null;
-        if (entry && typeof entry.access === "string" && entry.access.length > 0) {
-          headers.authorization = `Bearer ${entry.access}`;
-        } else {
-          debug(`no kimi-coding access token in ${AUTH_FILE}`);
-        }
-      } catch (error) {
-        debug(`auth.json unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    // Prefer the live token from auth.json: pi refreshes it there on real
+    // requests, while captured request headers freeze the token from capture
+    // time — hours later that Bearer can already be expired (HTTP 401).
+    // Fall back to the captured headers when auth.json is unavailable.
+    try {
+      const raw = JSON.parse(readFileSync(authFile(), "utf8")) as Record<string, unknown>;
+      const entry = (raw["kimi-coding"] ?? null) as { access?: unknown } | null;
+      if (entry && typeof entry.access === "string" && entry.access.length > 0) {
+        const headers = buildProbeHeaders(capture.headers);
+        headers.authorization = `Bearer ${entry.access}`;
+        return headers;
       }
+      debug(`no kimi-coding access token in ${authFile()}`);
+    } catch (error) {
+      debug(
+        `auth.json unavailable (${error instanceof Error ? error.message : String(error)}) — falling back to captured headers`,
+      );
     }
-    if (!headers.authorization) return null;
-    return headers;
+    const headers = buildProbeHeaders(capture.headers);
+    return headers.authorization ? headers : null;
   }
 
   async function runProbe(): Promise<boolean> {
