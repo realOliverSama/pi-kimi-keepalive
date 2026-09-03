@@ -952,8 +952,23 @@ export default function (pi: ExtensionAPI) {
     const raw = payload as Record<string, unknown>;
     if (!Array.isArray(raw.messages) || raw.messages.length === 0) return;
     if (raw.system !== undefined && !Array.isArray(raw.system) && typeof raw.system !== "string") return;
+    let clonedPayload: Record<string, unknown>;
+    try {
+      clonedPayload = structuredClone(raw);
+    } catch {
+      // DataCloneError: the payload carries non-cloneable values (BigInt,
+      // symbols, functions). Fall back to a JSON round-trip; probing never
+      // mutates the captured payload, so a by-reference capture is the last
+      // resort rather than failing the real request.
+      try {
+        clonedPayload = JSON.parse(JSON.stringify(raw)) as Record<string, unknown>;
+      } catch {
+        debug("payload not cloneable — capturing by reference");
+        clonedPayload = raw;
+      }
+    }
     capture = {
-      payload: structuredClone(raw),
+      payload: clonedPayload,
       headers: capturedHeaders,
       provider: model.provider,
       api: (model as { api?: string }).api,

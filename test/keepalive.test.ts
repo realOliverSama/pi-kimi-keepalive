@@ -860,3 +860,29 @@ test("/keepalive maxidle=1h actually sets and persists the cutoff", async (t) =>
   assert.equal(disabled.maxIdleMs, 0);
   assert.match(lastNotification(ctx), /maxidle disabled/);
 });
+
+test("capture survives a non-cloneable payload (no DataCloneError in the hook)", async (t) => {
+  clearHomeState();
+  writeState({ enabled: true, intervalMs: 60_000, maxIdleMs: 0, spendCapUsd: 0, minPromptTokens: 512 });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  factory(pi);
+  await pi.emit("session_start", {}, ctx);
+  await pi.emit("before_provider_headers", { headers: HEADERS }, ctx);
+  const payload = structuredClone(PAYLOAD) as Record<string, unknown>;
+  (payload as { weird: unknown }).weird = Symbol("x"); // Symbol: structuredClone throws DataCloneError
+  // Should not throw; capture falls back to a JSON round-trip / reference.
+  await pi.emit("before_provider_request", { payload }, ctx);
+
+  await pi.command("on", ctx);
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+  assert.equal(fetchStub.calls.length, 1, "probe should fire — capture survived");
+  const body = JSON.parse(fetchStub.calls[0].init.body);
+  assert.deepEqual(body.messages, PAYLOAD.messages);
+});
