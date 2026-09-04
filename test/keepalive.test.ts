@@ -17,7 +17,7 @@ process.env.HOME = mkdtempSync(join(tmpdir(), "pi-keepalive-test-"));
 // Redirect auth.json too (probeHeaders reads the live token from there).
 process.env.PI_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-keepalive-test-agent-"));
 
-const { default: factory } = await import("../src/index.ts");
+const { default: factory, FALLBACK_VERSION } = await import("../src/index.ts");
 import * as lib from "../src/lib.ts";
 
 // ---------------------------------------------------------------------------
@@ -913,4 +913,9 @@ test("capture survives a non-cloneable payload (no DataCloneError in the hook)",
   assert.equal(fetchStub.calls.length, 1, "probe should fire — capture survived");
   const body = JSON.parse(fetchStub.calls[0].init.body);
   assert.deepEqual(body.messages, PAYLOAD.messages);
+});
+
+test("in-source FALLBACK_VERSION stays in sync with package.json", () => {
+  const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+  assert.equal(FALLBACK_VERSION, pkg.version);
 });

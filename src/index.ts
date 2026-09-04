@@ -52,16 +52,25 @@ import {
 const STATE_DIR = join(homedir(), ".pi", "cache-keepalive");
 const STATE_FILE = join(STATE_DIR, "state.json");
 
-/** Package version, read from the package.json that ships this extension. */
+/** Version of record; kept in sync with package.json (enforced by a test). */
+export const FALLBACK_VERSION = "0.3.6";
+
+/**
+ * Package version. The relative import.meta.url read works when the extension
+ * is loaded from its package directory (npm / repo); some host loaders copy or
+ * transpile the .ts elsewhere, losing the relative anchor — then the constant
+ * above is the source of truth.
+ */
 function ownVersion(): string {
   try {
     const pkg = JSON.parse(
       readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
     ) as { version?: unknown };
-    return typeof pkg.version === "string" ? pkg.version : "unknown";
+    if (typeof pkg.version === "string") return pkg.version;
   } catch {
-    return "unknown";
+    // fall through to the in-source constant
   }
+  return FALLBACK_VERSION;
 }
 /** Live OAuth state; resolved lazily so tests can redirect it via PI_AGENT_DIR. */
 function authFile(): string {
