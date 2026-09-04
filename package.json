@@ -1,6 +1,6 @@
 {
   "name": "pi-kimi-keepalive",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Prompt-cache keepalive for Kimi (kimi-coding) sessions in the Pi coding agent. Replays the last real provider request while idle so the automatic prefix cache never expires.",
   "type": "module",
   "license": "MIT",

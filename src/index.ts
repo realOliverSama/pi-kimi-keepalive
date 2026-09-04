@@ -51,6 +51,18 @@ import {
 
 const STATE_DIR = join(homedir(), ".pi", "cache-keepalive");
 const STATE_FILE = join(STATE_DIR, "state.json");
+
+/** Package version, read from the package.json that ships this extension. */
+function ownVersion(): string {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    ) as { version?: unknown };
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 /** Live OAuth state; resolved lazily so tests can redirect it via PI_AGENT_DIR. */
 function authFile(): string {
   return join(process.env.PI_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "auth.json");
@@ -717,7 +729,7 @@ export default function (pi: ExtensionAPI) {
       const savings = hasPricing(capture?.cost) ? formatUsd(stats.savedUsd) : "n/a (no price data)";
       ctx.ui.setStatus("cache-keepalive", `♥ ${state}`);
       ctx.ui.setWidget("cache-keepalive", [
-        "pi-kimi-keepalive",
+        `pi-kimi-keepalive v${ownVersion()}`,
         `  state:   ${state}`,
         `  probes:  ${stats.probes} sent · ${stats.hits} hits · ${stats.misses} misses · ${stats.errors} errors`,
         `  est.:    saved ${savings} · probe spend ${formatUsd(stats.spendUsd)} · cap ${config.spendCapUsd === null ? "none" : formatUsd(config.spendCapUsd)}`,
@@ -740,7 +752,7 @@ export default function (pi: ExtensionAPI) {
       ? `${capture.provider} (${capture.api ?? "unknown api"}) @ ${capture.baseUrl}`
       : "none yet — probes start after your first real turn";
     return [
-      "pi-kimi-keepalive",
+      `pi-kimi-keepalive v${ownVersion()}`,
       `  state:     ${config.enabled ? "on" : "off"}${pausedReason ? ` (paused: ${pausedReason})` : ""}`,
       `  capture:   ${route}`,
       `  mode: ${config.mode}${config.mode === "smart" ? ` · cadence ${formatDuration(config.intervalMs)}${lastProbeInputTokens > SMART_MAX_CONTEXT_TOKENS ? ` · context ${lastProbeInputTokens.toLocaleString()} > cap, frozen at floor` : ""}` : " (fixed via interval=)"}`,
