@@ -919,3 +919,28 @@ test("in-source FALLBACK_VERSION stays in sync with package.json", () => {
   const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
   assert.equal(FALLBACK_VERSION, pkg.version);
 });
+
+test("status surfaces per-probe cost and cache hit rate", async (t) => {
+  clearHomeState();
+  writeState({ enabled: true, intervalMs: 7 * 60_000, maxIdleMs: 0, spendCapUsd: 0, minPromptTokens: 512 });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await pi.command("on", ctx);
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+
+  const before = ctx.ui.notifications.length;
+  await pi.command("status", ctx);
+  const status = ctx.ui.notifications.slice(before).map((n) => n.text).join("\n");
+  assert.match(status, /per probe/);
+  assert.match(status, /\/h while idle/);
+  // 50k cached of 52k prompt tokens = 96.2%
+  assert.match(status, /96\.2% of 52,000 prompt tokens cached/);
+});

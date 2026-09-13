@@ -193,6 +193,8 @@ export default function (pi: ExtensionAPI) {
   // clears it (a fresh real turn does NOT resume probing in this case).
   let smartPaused = false;
   let lastProbeInputTokens = 0;
+  let lastProbeCacheReadTokens = 0;
+  let lastProbeSpendUsd = 0;
   const stats: Stats = { probes: 0, hits: 0, misses: 0, errors: 0, savedUsd: 0, spendUsd: 0 };
 
   // ---------- persistence ----------
@@ -585,6 +587,8 @@ export default function (pi: ExtensionAPI) {
     stats.probes += 1;
     stats.spendUsd += estimateProbeSpendUsd(usage, capture.cost);
     lastProbeInputTokens = usage.inputTokens;
+    lastProbeCacheReadTokens = usage.cacheReadTokens;
+    lastProbeSpendUsd = estimateProbeSpendUsd(usage, capture.cost);
 
     if (!isCacheMiss(usage.inputTokens, usage.cacheReadTokens, config.minPromptTokens)) {
       stats.hits += 1;
@@ -741,7 +745,7 @@ export default function (pi: ExtensionAPI) {
         `pi-kimi-keepalive v${ownVersion()}`,
         `  state:   ${state}`,
         `  probes:  ${stats.probes} sent · ${stats.hits} hits · ${stats.misses} misses · ${stats.errors} errors`,
-        `  est.:    saved ${savings} · probe spend ${formatUsd(stats.spendUsd)} · cap ${config.spendCapUsd === null ? "none" : formatUsd(config.spendCapUsd)}`,
+        `  est.:    saved ${savings} · probe spend ${formatUsd(stats.spendUsd)}${stats.probes > 0 ? ` (≈${formatUsd(stats.spendUsd / stats.probes)}/probe)` : ""} · cap ${config.spendCapUsd === null ? "none" : formatUsd(config.spendCapUsd)}`,
       ]);
     } catch {
       // UI unavailable; ignore.
@@ -756,6 +760,29 @@ export default function (pi: ExtensionAPI) {
 
   // ---------- command ----------
 
+  /**
+   * Cache reads are billed too: surface what a probe actually costs and how
+   * often it runs, so a large context's idle-hold cost is visible instead of
+   * hiding behind a bare "hit" counter.
+   */
+  function probeCostLines(): string {
+    if (stats.probes === 0 || !hasPricing(capture?.cost)) {
+      return "no probe yet (cost = cache-read price × context size)";
+    }
+    const avg = stats.spendUsd / stats.probes;
+    const perHour = avg * (3_600_000 / Math.max(1, config.intervalMs));
+    return `≈${formatUsd(lastProbeSpendUsd)} last · ≈${formatUsd(avg)} avg per probe · ≈${formatUsd(perHour)}/h while idle`;
+  }
+
+  function hitRateLine(): string {
+    if (lastProbeInputTokens <= 0) return "n/a";
+    const pct = ((lastProbeCacheReadTokens / lastProbeInputTokens) * 100).toFixed(1);
+    const tail = lastProbeCacheReadTokens / lastProbeInputTokens < 0.9
+      ? " — partial hit: the uncached tail is billed at full input price"
+      : "";
+    return `${pct}% of ${lastProbeInputTokens.toLocaleString()} prompt tokens cached${tail}`;
+  }
+
   function statusLines(): string[] {
     const route = capture
       ? `${capture.provider} (${capture.api ?? "unknown api"}) @ ${capture.baseUrl}`
@@ -768,6 +795,8 @@ export default function (pi: ExtensionAPI) {
       `  interval:  ${formatDuration(config.intervalMs)} · maxidle ${config.maxIdleMs === 0 ? "off" : formatDuration(config.maxIdleMs)} · minPromptTokens ${config.minPromptTokens} · maxOutput ${config.maxOutputTokens}`,
       `  spend cap: ${config.spendCapUsd === null ? "none" : formatUsd(config.spendCapUsd)} · est. probe spend ${formatUsd(stats.spendUsd)}`,
       `  probes:    ${stats.probes} (hits ${stats.hits}, misses ${stats.misses}, errors ${stats.errors})`,
+      `  cost:      ${probeCostLines()}`,
+      `  hit rate:  ${hitRateLine()}`,
       `  saved:     ${hasPricing(capture?.cost) ? formatUsd(stats.savedUsd) : "n/a (no price data)"} · next probe ${formatClock(nextProbeAt)}`,
     ];
   }

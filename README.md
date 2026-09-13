@@ -74,6 +74,17 @@ If the cache does expire underneath it (server-side eviction, TTL change), the m
 
 Per learn cycle the spend is minimal: 3 cache-read probes confirm a step, and one full-price probe ends the cycle — the parked cadence keeps every future session at the highest value the cache has proven to hold.
 
+## What a probe costs
+
+A cache hit is not free: the cached prefix is billed at the **cache-read price**, which is why a large context still costs real money while idle. At the time of writing that is roughly:
+
+```
+probe cost ≈ prompt tokens × cache-read price
+           (+ any uncached tail at full input price, + the clamped output)
+```
+
+A 300k-token context therefore costs about **$0.09 per probe**; at a 7-minute cadence that is ~$0.79/h of idle time, versus ~$0.91 for the single full-price cold read it prevents. `/keepalive` surfaces both numbers — the per-probe cost and the share of prompt tokens that actually hit the cache (`hit rate`) — so the trade-off is visible. `maxidle` caps the exposure.
+
 ## Commands
 
 ```
