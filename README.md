@@ -83,7 +83,13 @@ probe cost ≈ prompt tokens × cache-read price
            (+ any uncached tail at full input price, + the clamped output)
 ```
 
-A 300k-token context therefore costs about **$0.09 per probe**; at a 7-minute cadence that is ~$0.79/h of idle time, versus ~$0.91 for the single full-price cold read it prevents. `/keepalive` surfaces both numbers — the per-probe cost and the share of prompt tokens that actually hit the cache (`hit rate`) — so the trade-off is visible. `maxidle` caps the exposure.
+A 300k-token context therefore costs about **$0.09 per probe**; at a 7-minute cadence that is ~$0.79/h of idle time, versus ~$0.91 for the single full-price cold read it prevents. `/keepalive` surfaces both numbers — the per-probe cost and the share of prompt tokens that actually hit the cache (`hit rate`) — and every probe also appends a line to `~/.pi/cache-keepalive/probe-log.jsonl`:
+
+```json
+{"at":"…","promptTokens":304000,"cachedTokens":288000,"uncachedTokens":16000,"outputTokens":16,"hitRatio":0.9474,"estUsd":0.1344}
+```
+
+The log makes partial hits auditable after the fact: a hit ratio well below 1 means the uncached tail was billed at full input price, which is what makes a "hit" expensive on a large context. `maxidle` caps the exposure.
 
 ## Commands
 

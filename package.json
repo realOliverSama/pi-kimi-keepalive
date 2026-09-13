@@ -1,6 +1,6 @@
 {
   "name": "pi-kimi-keepalive",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Prompt-cache keepalive for Kimi (kimi-coding) sessions in the Pi coding agent. Replays the last real provider request while idle so the automatic prefix cache never expires.",
   "type": "module",
   "license": "MIT",
@@ -35,7 +35,8 @@
   ],
   "scripts": {
     "test": "node --test test/keepalive.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postversion": "node scripts/sync-version.mjs"
   },
   "engines": {
     "node": ">=20"

@@ -27,7 +27,7 @@
  * experiment with guardrails, not a savings promise.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -51,9 +51,10 @@ import {
 
 const STATE_DIR = join(homedir(), ".pi", "cache-keepalive");
 const STATE_FILE = join(STATE_DIR, "state.json");
+const PROBE_LOG_FILE = join(STATE_DIR, "probe-log.jsonl");
 
 /** Version of record; kept in sync with package.json (enforced by a test). */
-export const FALLBACK_VERSION = "0.3.6";
+export const FALLBACK_VERSION = "0.3.8";
 
 /**
  * Package version. The relative import.meta.url read works when the extension
@@ -589,6 +590,7 @@ export default function (pi: ExtensionAPI) {
     lastProbeInputTokens = usage.inputTokens;
     lastProbeCacheReadTokens = usage.cacheReadTokens;
     lastProbeSpendUsd = estimateProbeSpendUsd(usage, capture.cost);
+    appendProbeLog(usage);
 
     if (!isCacheMiss(usage.inputTokens, usage.cacheReadTokens, config.minPromptTokens)) {
       stats.hits += 1;
@@ -697,6 +699,34 @@ export default function (pi: ExtensionAPI) {
         `probing stopped, run /keepalive mode=smart to resume`,
     );
     updateUi();
+  }
+
+  /**
+   * Append one line per probe to ~/.pi/cache-keepalive/probe-log.jsonl so the
+   * real per-probe billing (cached vs full-price tokens) can be audited after
+   * the fact — the hit/miss counter alone hides partial hits, which are what
+   * make a "hit" expensive on a large context.
+   */
+  function appendProbeLog(usage: ParsedUsage): void {
+    try {
+      const prompt = usage.inputTokens;
+      const cached = usage.cacheReadTokens;
+      const entry = {
+        at: new Date().toISOString(),
+        mode: config.mode,
+        intervalMs: config.intervalMs,
+        promptTokens: prompt,
+        cachedTokens: cached,
+        uncachedTokens: Math.max(0, prompt - cached),
+        outputTokens: usage.outputTokens,
+        hitRatio: prompt > 0 ? Number((cached / prompt).toFixed(4)) : 0,
+        estUsd: Number(estimateProbeSpendUsd(usage, capture?.cost).toFixed(6)),
+      };
+      mkdirSync(STATE_DIR, { recursive: true });
+      appendFileSync(PROBE_LOG_FILE, JSON.stringify(entry) + "\n");
+    } catch (error) {
+      debug("probe log unavailable:", error);
+    }
   }
 
   function recordFailure(message: string): void {

@@ -83,7 +83,13 @@ pi -e git:github.com/realoliversama/pi-kimi-keepalive          # 从 GitHub
              （+ 未命中的尾部按全价 input 计费，+ 被钳制的 output）
 ```
 
-例如 300k tokens 的上下文，单次探测约 **$0.09**；7 分钟间隔意味着空闲 1 小时约 $0.79，而它避免的那次全价冷读约 $0.91。`/keepalive` 状态现在同时显示**单次探测花费**与**实际命中缓存的比例**（hit rate），让这笔权衡可见；`maxidle` 负责封顶。
+例如 300k tokens 的上下文，单次探测约 **$0.09**；7 分钟间隔意味着空闲 1 小时约 $0.79，而它避免的那次全价冷读约 $0.91。`/keepalive` 状态现在同时显示**单次探测花费**与**实际命中缓存的比例**（hit rate），并且每次探测都会向 `~/.pi/cache-keepalive/probe-log.jsonl` 追加一行明细：
+
+```json
+{"at":"…","promptTokens":304000,"cachedTokens":288000,"uncachedTokens":16000,"outputTokens":16,"hitRatio":0.9474,"estUsd":0.1344}
+```
+
+这条日志让部分命中可以事后对账：hitRatio 明显低于 1 说明未命中的尾部按全价 input 计费——这正是大上下文下“显示 hit 却很贵”的原因。`maxidle` 负责封顶。
 
 ## 命令
 

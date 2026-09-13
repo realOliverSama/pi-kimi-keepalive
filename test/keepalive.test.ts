@@ -61,9 +61,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const STATE_DIR = () => join(process.env.HOME, ".pi", "cache-keepalive");
 const statePath = () => join(STATE_DIR(), "state.json");
+const probeLogPath = () => join(STATE_DIR(), "probe-log.jsonl");
 
 const clearHomeState = () => {
   rmSync(statePath(), { force: true });
+  rmSync(probeLogPath(), { force: true });
 };
 
 function writeState(cfg) {
@@ -943,4 +945,30 @@ test("status surfaces per-probe cost and cache hit rate", async (t) => {
   assert.match(status, /\/h while idle/);
   // 50k cached of 52k prompt tokens = 96.2%
   assert.match(status, /96\.2% of 52,000 prompt tokens cached/);
+});
+
+test("each probe appends a probe-log line with billing detail", async (t) => {
+  clearHomeState();
+  writeState({ enabled: true, intervalMs: 60_000, maxIdleMs: 0, spendCapUsd: 0, minPromptTokens: 512 });
+  const pi = makePi();
+  const ctx = makeCtx();
+  const fetchStub = stubFetch();
+  t.after(async () => {
+    await shutdown(pi, ctx);
+    fetchStub.restore();
+  });
+  factory(pi);
+  await captureOnce(pi, ctx);
+  await pi.command("now", ctx);
+  await settle(pi, ctx);
+
+  const lines = readFileSync(probeLogPath(), "utf8").trim().split("\n");
+  assert.equal(lines.length, 1);
+  const entry = JSON.parse(lines[0]);
+  assert.equal(entry.promptTokens, 52_000);
+  assert.equal(entry.cachedTokens, 50_000);
+  assert.equal(entry.uncachedTokens, 2_000); // billed at full input price
+  assert.equal(entry.hitRatio, 0.9615);
+  assert.ok(entry.estUsd > 0);
+  assert.ok(typeof entry.at === "string");
 });
